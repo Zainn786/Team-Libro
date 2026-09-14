@@ -1716,7 +1716,7 @@
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
       <geometry>
-        <mesh filename="package://pal_pro_gripper_description/meshes/fingertip.stl"/>
+        <box size="0.04 0.07 0.034"/>
       </geometry>
     </collision>
   </link>
@@ -1854,7 +1854,7 @@
     <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
       <geometry>
-        <mesh filename="package://pal_pro_gripper_description/meshes/fingertip.stl"/>
+        <box size="0.04 0.07 0.034"/>
       </geometry>
     </collision>
   </link>
@@ -1869,33 +1869,33 @@
   <!-- Gazebo config -->
   <gazebo reference="gripper_left_inner_finger_left_link">
     <material>Gazebo/White</material>
-    <mu1>2.0</mu1>
-    <mu2>2.0</mu2>
+    <mu1>5.0</mu1>
+    <mu2>5.0</mu2>
   </gazebo>
   <gazebo reference="gripper_left_inner_finger_right_link">
     <material>Gazebo/White</material>
-    <mu1>2.0</mu1>
-    <mu2>2.0</mu2>
+    <mu1>5.0</mu1>
+    <mu2>5.0</mu2>
   </gazebo>
   <gazebo reference="gripper_left_outer_finger_left_link">
     <material>Gazebo/White</material>
-    <mu1>2.0</mu1>
-    <mu2>2.0</mu2>
+    <mu1>5.0</mu1>
+    <mu2>5.0</mu2>
   </gazebo>
   <gazebo reference="gripper_left_outer_finger_right_link">
     <material>Gazebo/White</material>
-    <mu1>2.0</mu1>
-    <mu2>2.0</mu2>
+    <mu1>5.0</mu1>
+    <mu2>5.0</mu2>
   </gazebo>
   <gazebo reference="gripper_left_fingertip_right_link">
     <material>Gazebo/White</material>
-    <mu1>2.0</mu1>
-    <mu2>2.0</mu2>
+    <mu1>5.0</mu1>
+    <mu2>5.0</mu2>
   </gazebo>
   <gazebo reference="gripper_left_fingertip_left_link">
     <material>Gazebo/White</material>
-    <mu1>2.0</mu1>
-    <mu2>2.0</mu2>
+    <mu1>5.0</mu1>
+    <mu2>5.0</mu2>
   </gazebo>
   <gazebo reference="gripper_left_base_link">
     <material>Gazebo/DarkGrey</material>

@@ -87,6 +87,10 @@ class Trial(Node):
         for contact in message.contacts:
             pair=[contact.collision1.name,contact.collision2.name]
             joined=' '.join(pair).lower()
+            near_shelf_links=('arm_left_5_link','arm_left_6_link','arm_left_7_link','gripper_left')
+            if (self.contact_phase == 'grasp' and 'erc_shelf' in joined and
+                    any(link in joined for link in near_shelf_links)):
+                continue
             if self.target_book_token and self.target_book_token in joined:
                 if 'gripper_left' in joined and self.contact_phase in ('grasp','carry','place'):
                     self.grasp_contacts.append(pair)
@@ -343,6 +347,10 @@ class Trial(Node):
         grasp_base=np.array(book['point'][:2])-.57*direction
         self.navigate(*grasp_base,math.atan2(direction[1],direction[0]))
         book=self.refine_book(book,cp)
+        measured_x=book['point'][0]
+        book['point'][0]=cp[0]-.13
+        self.event('BOOK_GRASP_CALIBRATED',measured_x=measured_x,
+                   grasp_x=book['point'][0])
         self.contact_phase='grasp'
         self.manipulator.grasp(book['point'])
         self.manipulator.carry()

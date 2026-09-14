@@ -29,11 +29,11 @@ def test_lost_book_model_is_removed_after_detachment():
 def test_insertion_is_normal_to_shelf_without_lateral_sweep():
     pre,grasp,pull,lift=Manipulator.shelf_grasp_points([.94,-2.83,.605])
     assert np.allclose(pre,[.94,-2.53,.605])
-    assert np.allclose(grasp,[.94,-2.97,.605])
+    assert np.allclose(grasp,[.94,-2.93,.605])
     assert np.allclose(pull,[.94,-2.73,.630])
-    # The post-extraction lift is deliberately limited to 5 cm to retain shelf
+    # The post-extraction lift is deliberately limited to 3 cm to retain shelf
     # clearance while confirming that the book remains secured.
-    assert np.allclose(lift,[.94,-2.73,.680])
+    assert np.allclose(lift,[.94,-2.73,.660])
 
 
 def test_cartesian_slowdown_preserves_consistent_motion_derivatives():
@@ -47,6 +47,18 @@ def test_cartesian_slowdown_preserves_consistent_motion_derivatives():
     assert point.time_from_start.nanosec==0
     assert np.allclose(point.velocities,[.2])
     assert np.allclose(point.accelerations,[.1])
+
+
+def test_cartesian_normal_speed_preserves_timing_and_derivatives():
+    point=JointTrajectoryPoint(positions=[.4],velocities=[.8],accelerations=[1.6])
+    point.time_from_start.sec=1
+    point.time_from_start.nanosec=500_000_000
+    trajectory=JointTrajectory(joint_names=['arm_left_1_joint'],points=[point])
+    Manipulator.slow_cartesian(trajectory,time_scale=1.)
+    assert point.time_from_start.sec==1
+    assert point.time_from_start.nanosec==500_000_000
+    assert np.allclose(point.velocities,[.8])
+    assert np.allclose(point.accelerations,[1.6])
 
 
 def test_cartesian_continuity_accepts_varying_small_steps():

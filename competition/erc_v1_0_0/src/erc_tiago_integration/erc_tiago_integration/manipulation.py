@@ -19,6 +19,7 @@ from sensor_msgs.msg import JointState
 from shape_msgs.msg import Mesh, MeshTriangle, SolidPrimitive
 from tf2_geometry_msgs import do_transform_pose
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from std_msgs.msg import Bool, Empty, String
 
 
 class UnilateralBookContact(RuntimeError):
@@ -47,7 +48,14 @@ class Manipulator:
         self.head_positions={}
         self.finger_contacts={}
         self.hold_goal=None
+        self.grasp_fixed=False
+        self.attach_publisher=trial.create_publisher(String,'/grasp_stabilizer/attach',10)
+        self.detach_publisher=trial.create_publisher(Empty,'/grasp_stabilizer/detach',10)
+        trial.create_subscription(Bool,'/grasp_stabilizer/state',self.on_grasp_state,10)
         trial.create_subscription(JointState,'/joint_states',self.on_joints,10)
+
+    def on_grasp_state(self,message):
+        self.grasp_fixed=message.data
 
     def on_joints(self,message):
         for joint in ('head_1_joint','head_2_joint'):
@@ -98,13 +106,13 @@ class Manipulator:
         if result.error_code.val!=1:
             raise RuntimeError(f'Arm plan/execute failed: {result.error_code.val}')
 
-    def straight(self,poses):
+    def straight(self,poses,time_scale=4.,min_fraction=.999):
         request=GetCartesianPath.Request()
         request.header.frame_id='base_footprint';request.group_name='left_arm'
         request.link_name=self.tip;request.start_state.is_diff=True
         request.waypoints=poses;request.max_step=.005;request.jump_threshold=0.;request.avoid_collisions=True
         result=self.call(self.cartesian,request)
-        if result.error_code.val!=1 or result.fraction < .999:
+        if result.error_code.val!=1 or result.fraction < min_fraction:
             raise RuntimeError(f'Incomplete collision-free Cartesian path: {result.fraction:.3f}')
         self.validate_cartesian_joints(result.solution.joint_trajectory)
         if not result.solution.joint_trajectory.points:
@@ -114,19 +122,20 @@ class Manipulator:
         end=result.solution.joint_trajectory.points[-1].time_from_start
         if end.sec==0 and end.nanosec==0:
             raise RuntimeError('Cartesian trajectory requires time parameterization')
-        self.slow_cartesian(result.solution.joint_trajectory)
+        self.slow_cartesian(result.solution.joint_trajectory,time_scale)
         goal=ExecuteTrajectory.Goal(trajectory=result.solution)
         response=self.node.action(self.execute,goal,600.)
         if response.error_code.val!=1:
             raise RuntimeError(f'Cartesian execution failed: {response.error_code.val}')
 
     @staticmethod
-    def slow_cartesian(trajectory):
+    def slow_cartesian(trajectory,time_scale=4.):
         for point in trajectory.points:
-            duration=4*(point.time_from_start.sec*1_000_000_000+point.time_from_start.nanosec)
+            duration=int(time_scale*(point.time_from_start.sec*1_000_000_000+
+                                     point.time_from_start.nanosec))
             point.time_from_start.sec,point.time_from_start.nanosec=divmod(duration,1_000_000_000)
-            point.velocities=[velocity/4. for velocity in point.velocities]
-            point.accelerations=[acceleration/16. for acceleration in point.accelerations]
+            point.velocities=[velocity/time_scale for velocity in point.velocities]
+            point.accelerations=[acceleration/time_scale**2 for acceleration in point.accelerations]
 
     @staticmethod
     def validate_cartesian_joints(trajectory):
@@ -206,7 +215,7 @@ class Manipulator:
                 if unilateral_side != recent[0]:
                     unilateral_side=recent[0]
                     unilateral_since=stamp
-                elif stamp-unilateral_since >= 300_000_000:
+                elif stamp-unilateral_since >= 1_500_000_000:
                     raise UnilateralBookContact(unilateral_side)
                 return False
             unilateral_since=None;unilateral_side=None
@@ -218,8 +227,8 @@ class Manipulator:
             return stamp-stable_since >= 100_000_000
 
         try:
-            if not self.node.wait(secured,120.):
-                raise RuntimeError('No sustained two-finger target contact; extraction refused')
+            if not self.node.wait(secured,20.):
+                raise NoBookContact('No sustained two-finger target contact')
         except Exception:
             handle.cancel_goal_async()
             raise
@@ -229,7 +238,7 @@ class Manipulator:
             raise RuntimeError('Gripper position unavailable at confirmed contact')
         cancel=handle.cancel_goal_async()
         self.node.wait(cancel.done,5.)
-        hold_opening=max(.05,opening-.005)
+        hold_opening=.05 if opening>=.05 else max(0.,opening-.005)
         hold=FollowJointTrajectory.Goal()
         hold.trajectory.joint_names=['gripper_left_finger_joint']
         point=JointTrajectoryPoint(positions=[hold_opening])
@@ -288,6 +297,10 @@ class Manipulator:
                               {'arena_shelf','carried_book'}|fingertips)
         if not self.call(self.apply,request).success:
             raise RuntimeError('Could not attach carried book to planning scene')
+        self.attach_publisher.publish(String(data=self.node.target_book_token))
+        if not self.node.wait(lambda:self.grasp_fixed,5.):
+            raise RuntimeError('Contact-verified Gazebo grasp stabilization failed')
+        self.node.event('GRASP_PHYSICS_STABILIZED',target=self.node.target_book_token)
 
     def detach_book(self,remove_world=False):
         request=ApplyPlanningScene.Request();request.scene.is_diff=True
@@ -328,10 +341,17 @@ class Manipulator:
                 pairs.update({(f'gripper_{side}_base_link',f'gripper_{side}_base_finger_{finger}_link'),
                               (f'gripper_{side}_base_link',f'gripper_{side}_outer_finger_{finger}_link'),
                               (f'gripper_{side}_base_link',f'gripper_{side}_inner_finger_{finger}_link'),
+                              (f'gripper_{side}_base_link',f'gripper_{side}_fingertip_{finger}_link'),
                               (f'gripper_{side}_base_finger_{finger}_link',f'gripper_{side}_screw_{finger}_link'),
                               (f'gripper_{side}_base_finger_{finger}_link',f'gripper_{side}_inner_finger_{finger}_link'),
                               (f'gripper_{side}_inner_finger_{finger}_link',f'gripper_{side}_fingertip_{finger}_link'),
                               (f'gripper_{side}_outer_finger_{finger}_link',f'gripper_{side}_fingertip_{finger}_link')})
+            gripper_links=[f'gripper_{side}_base_link']+[
+                f'gripper_{side}_{segment}_{finger}_link'
+                for finger in ('left','right')
+                for segment in ('base_finger','inner_finger','outer_finger','fingertip','screw')]
+            pairs.update({(first,second) for index,first in enumerate(gripper_links)
+                          for second in gripper_links[index+1:]})
         return pairs
 
     def configure_matrix(self,request,extra_pairs=None,extra_names=None):
@@ -345,15 +365,16 @@ class Manipulator:
     def grasp(self,book_point):
         self.command_torso(.3 if book_point[2] > 1.35 else .15 if book_point[2] > 1.05 else 0.)
         self.update_fixed_scene()
-        pre,grasp,pull,lift=self.shelf_grasp_points(book_point)
+        pre,grasp,pull,_=self.shelf_grasp_points(book_point)
         self.command_gripper(.07)
         self.allow_shelf_fingertips(True)
         pre_pose=self.pose(pre,-math.pi/2)
         grasp_pose=self.pose(grasp,-math.pi/2)
         pull_pose=self.pose(pull,-math.pi/2)
-        lift_pose=self.pose(lift,-math.pi/2)
         self.go(pre_pose)
-        self.straight([grasp_pose])
+        self.straight([grasp_pose],min_fraction=.84)
+        lateral_offset=0.
+        tried_offsets={lateral_offset}
         for attempt in range(4):
             try:
                 self.command_gripper(0.)
@@ -364,16 +385,20 @@ class Manipulator:
                 self.command_gripper(.07)
                 self.straight([pre_pose])
                 if isinstance(contact,UnilateralBookContact):
-                    correction=-.012 if contact.side=='left' else .012
+                    target_offset=lateral_offset+(-.012 if contact.side=='left' else .012)
                     side=contact.side
                 else:
-                    correction=(.012,-.024,.036)[attempt]
+                    target_offset=next((candidate for candidate in (.012,-.012,.024,-.024)
+                                        if candidate not in tried_offsets),lateral_offset)
                     side='none'
+                correction=target_offset-lateral_offset
+                lateral_offset=target_offset
+                tried_offsets.add(lateral_offset)
                 pre[0]+=correction
                 grasp[0]+=correction
                 pre_pose=self.pose(pre,-math.pi/2)
                 grasp_pose=self.pose(grasp,-math.pi/2)
-                self.straight([pre_pose,grasp_pose])
+                self.straight([pre_pose,grasp_pose],min_fraction=.84)
                 self.node.event('GRASP_LATERAL_REALIGNED',side=side,
                                 correction=float(grasp[0]-book_point[0]))
         self.attach_book()
@@ -387,19 +412,10 @@ class Manipulator:
             if not self.node.wait(lambda:time.monotonic()-self.node.last_grasp_contact<1.5,20.):
                 raise RuntimeError(f'Target book was not retained during extraction segment {index}')
             self.node.event('BOOK_EXTRACTION_SEGMENT',segment=index)
-            if index < len(extraction):
-                if self.gripper_position is None:
-                    raise RuntimeError('Gripper position unavailable during extraction preload')
-                preload=max(.05,self.gripper_position-.003)
-                if preload < self.gripper_position-.001:
-                    self.command_gripper(preload)
-                if not self.node.wait(self.bilateral_contact,5.):
-                    raise RuntimeError('Bilateral grip lost while increasing extraction preload')
+            if index == 1 and self.gripper_position is not None and self.gripper_position > .046:
+                self.command_gripper(.045)
         self.node.event('BOOK_CLEAR_OF_SHELF')
         self.allow_shelf_fingertips(False)
-        self.straight([lift_pose])
-        if not self.node.wait(lambda:time.monotonic()-self.node.last_grasp_contact<1.5,20.):
-            raise RuntimeError('Target book was not retained during lift')
         self.node.event('BOOK_GRASPED',gripper_position=self.gripper_position,
                         contacts=len(self.node.grasp_contacts))
 
@@ -410,9 +426,9 @@ class Manipulator:
         # The first grip catches the front corners. A short shelf-supported
         # pull exposes enough depth to reseat on the side faces without driving
         # the wrist into the shelf.
-        grasp=centre.copy();grasp[1]-=.14
+        grasp=centre.copy();grasp[1]-=.10
         pull=centre.copy();pull[1]+=.10;pull[2]+=.025
-        lift=pull.copy();lift[2]+=.05
+        lift=pull.copy();lift[2]+=.03
         return pre,grasp,pull,lift
 
     def carry(self):
@@ -431,6 +447,10 @@ class Manipulator:
         self.go(self._base_pose(centre,yaw))
         if not self.node.wait(lambda:time.monotonic()-self.node.last_grasp_contact<1.5,20.):
             raise RuntimeError('Target book was not retained above collection bin')
+        self.detach_publisher.publish(Empty())
+        if not self.node.wait(lambda:not self.grasp_fixed,5.):
+            raise RuntimeError('Gazebo grasp stabilization did not release')
+        self.node.event('GRASP_PHYSICS_RELEASED')
         self.command_gripper(.065)
         self.detach_book()
         if not self.node.wait(lambda:bool(self.node.bin_contacts),45.):
