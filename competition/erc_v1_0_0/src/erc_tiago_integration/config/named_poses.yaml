@@ -1,0 +1,38 @@
+# Fixed arena-frame approach poses for simulator ROUTE TESTS ONLY.
+# The official spawn heading is pi/2, while MecanumDrive odometry starts at zero.
+# Competition shelf identity must come from live vision, never these column names.
+arena_start_yaw: 1.5707963267948966
+# Shelf labels are randomized, so these names describe physical columns only.
+poses:
+  start:
+    x: 0.0
+    y: 0.0
+    yaw: 1.5708
+  shelf_overview:
+    x: 1.35
+    y: 0.0
+    yaw: 0.0
+  shelf_column_1:
+    x: 1.35
+    y: 2.0
+    yaw: 0.0
+  shelf_column_2:
+    x: 1.35
+    y: 1.0
+    yaw: 0.0
+  shelf_column_3:
+    x: 1.35
+    y: 0.0
+    yaw: 0.0
+  shelf_column_4:
+    x: 1.35
+    y: -1.0
+    yaw: 0.0
+  shelf_column_5:
+    x: 1.35
+    y: -2.0
+    yaw: 0.0
+  delivery:
+    x: 0.20
+    y: 0.0
+    yaw: 3.14159

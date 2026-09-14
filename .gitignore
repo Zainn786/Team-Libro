@@ -1,0 +1,35 @@
+# ROS 2 / colcon outputs
+/build/
+/install/
+/log/
+
+# Local test and runtime outputs
+/.pytest_cache/
+/artifacts/
+/tmp/
+/erc_images/
+*.log
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local editor and agent state
+/.vscode/
+/.claude/
+/.agents/
+/.codex/
+
+# Earlier local Libro/Jazzy prototype. The ERC submission uses only the Humble
+# workspace under competition/erc_v1_0_0.
+/src/
+/docs/
+/scripts/
+
+# Separate upstream checkout used during development. The reproducible Humble
+# competition snapshot is committed under competition/erc_v1_0_0 instead.
+/competition/erc_sim_2026/
+/competition/COLCON_IGNORE
+
+# Generated evidence from simulator trials (source and tests remain tracked).
+/competition/erc_v1_0_0/src/erc_tiago_integration/*_evidence*/
+/competition/erc_v1_0_0/src/erc_tiago_integration/debug_camera*.png
