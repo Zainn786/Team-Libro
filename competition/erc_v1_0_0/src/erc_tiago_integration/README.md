@@ -109,6 +109,14 @@ meeting the rubric's full-column bounding-box requirement.
   front face and the grasp-frame offset. Possession is proven only by live
   contact reports. Nothing in this package depends on a modified robot model,
   world, or Gazebo plugin.
+  The gripper opens to 0.065 m, not its 0.070 m limit: commanding the limit can
+  leave the left finger joint settled just past it and permanently jammed, while
+  the gripper controller (no goal constraints) still reports success. A close
+  command that produces no finger travel and no contact within 4 s of sim time
+  raises `GripperJammed` instead of being retried as a missed book. Insertion
+  stops on first gripper contact with the target and uses the touching finger to
+  choose the lateral correction; the base squares up to the shelf normal before
+  the arm moves, and the upper arm carries a 30 mm world-collision margin.
 - `navigation_regression.py`: simulation-only routes to physical columns and back.
   These column coordinates are never used to resolve randomized shelf labels.
 

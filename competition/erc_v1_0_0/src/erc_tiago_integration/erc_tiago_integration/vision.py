@@ -64,6 +64,8 @@ class ShelfVision:
                 results.append({'colour': colour, 'bbox': [x,y,w,h]})
         return results
 
+    BIN_MIN_ASPECT = .6
+
     def bins(self, image):
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         mask = (cv2.inRange(hsv, (0, 100, 45), (12, 255, 255)) |
@@ -78,20 +80,31 @@ class ShelfVision:
             area = cv2.contourArea(contour)
             if h < 18 or w < 30 or area < max(250, image_area * .002):
                 continue
-            if w / h < 1.25 or area / (w * h) < .35:
+            # From the start zone the bin is ~1.1 m away, below the camera: a
+            # live frame showed it as one 143x149 px blob (aspect 0.96), which
+            # the former wide-only threshold of 1.25 rejected. Books on the
+            # shelf stay out through size, and the held book through the
+            # gripper-proximity check in perception.
+            if w / h < self.BIN_MIN_ASPECT or area / (w * h) < .35:
                 continue
             results.append({'colour': 'red', 'bbox': [x, y, w, h],
                             'confidence': float(min(1., area / max(1., w * h)))})
         return results
 
 
-def robust_depth(depth, bbox):
+def robust_depth(depth, bbox, max_spread=.20):
+    """Median depth of the central half of bbox, or None if it is unreliable.
+
+    max_spread rejects patches straddling two surfaces (a book edge against the
+    shelf behind it). Pass None for objects that legitimately span a range of
+    depths: an open bin seen from above covers rim to floor.
+    """
     x,y,w,h = bbox
     patch = depth[y+h//4:y+max(h//4+1,3*h//4), x+w//4:x+max(w//4+1,3*w//4)]
     values = patch[np.isfinite(patch) & (patch > .2) & (patch < 8.)]
     if values.size < 3:
         return None
     median = float(np.median(values))
-    if float(np.quantile(values,.9)-np.quantile(values,.1)) > .20:
+    if max_spread is not None and float(np.quantile(values,.9)-np.quantile(values,.1)) > max_spread:
         return None
     return median

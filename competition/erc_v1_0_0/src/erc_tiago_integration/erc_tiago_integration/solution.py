@@ -25,7 +25,10 @@ from ros_gz_interfaces.msg import Contacts
 from trajectory_msgs.msg import JointTrajectoryPoint
 
 from .perception import LivePerception
-from .manipulation import Manipulator
+from rcl_interfaces.srv import SetParameters
+from rclpy.parameter import Parameter
+
+from .manipulation import ActionInterrupted, Manipulator
 
 
 class Trial(Node):
@@ -60,6 +63,11 @@ class Trial(Node):
                                       '/arm_right_controller/follow_joint_trajectory')
         self.stop = self.create_publisher(Twist, '/cmd_vel_nav', 10)
         self.status = self.create_publisher(String, '/libro/trial_status', 10)
+        # MoveIt's execute_trajectory action accepts a cancel but keeps
+        # executing: an insertion cancelled on first contact ran on for 55 s,
+        # still pushing the book. The trajectory execution manager stops only on
+        # this event, the same one MoveGroupInterface::stop() publishes.
+        self.execution_event = self.create_publisher(String, '/trajectory_execution_event', 10)
         self.events = []
         self.started = time.monotonic()
         self.abort_reason = ''
@@ -136,26 +144,53 @@ class Trial(Node):
                 return True
         return False
 
-    def action(self, client, goal, timeout):
+    # An executor that is still tearing down a cancelled goal does not
+    # acknowledge the next one. After an insertion was stopped on contact,
+    # move_group never acknowledged the retreat and the trial failed; the
+    # cancelled execution had not finished inside the old 5 s wait.
+    ACK_TIMEOUT = 15.
+    ACK_ATTEMPTS = 3
+    CANCEL_SETTLE_TIMEOUT = 45.
+
+    def action(self, client, goal, timeout, interrupt=None):
         if self.abort_reason:
             raise RuntimeError(self.abort_reason)
         if not client.wait_for_server(timeout_sec=20.):
             raise RuntimeError(f'Action server unavailable: {client._action_name}')
-        future = client.send_goal_async(goal)
-        if not self.wait(future.done, 15.):
-            # Retain a callback to cancel any late acceptance.
+        for attempt in range(self.ACK_ATTEMPTS):
+            future = client.send_goal_async(goal)
+            if self.wait(future.done, self.ACK_TIMEOUT):
+                break
+            # Retain a callback to cancel any late acceptance before resending.
             future.add_done_callback(lambda f: f.result().cancel_goal_async() if f.result() and f.result().accepted else None)
-            raise RuntimeError('Action acknowledgement timeout')
+            if attempt == self.ACK_ATTEMPTS-1:
+                raise RuntimeError('Action acknowledgement timeout')
+            self.event('ACTION_ACK_RETRY', action=client._action_name, attempt=attempt+1)
         handle = future.result()
         if not handle.accepted:
             raise RuntimeError('Action rejected')
         self.active_goal = handle
         result = handle.get_result_async()
-        if not self.wait(result.done, timeout):
+        # An optional caller condition, polled while the goal runs, cancels it
+        # early -- used to stop an arm insertion on first contact with a book.
+        finished = result.done if interrupt is None else (lambda: result.done() or interrupt())
+        if not self.wait(finished, timeout):
             cancel = handle.cancel_goal_async()
             self.wait(cancel.done, 5.)
             self.wait(result.done, 5.)
             raise RuntimeError('Action timeout; cancelled')
+        if not result.done():
+            execution_event = getattr(self, 'execution_event', None)
+            if execution_event is not None:
+                execution_event.publish(String(data='stop'))
+            cancel = handle.cancel_goal_async()
+            self.wait(cancel.done, 10.)
+            # Wait for the executor to actually finish the cancelled goal, so
+            # the next goal is not sent while it is still busy.
+            if not self.wait(result.done, self.CANCEL_SETTLE_TIMEOUT):
+                self.event('ACTION_CANCEL_UNSETTLED', action=client._action_name)
+            self.active_goal = None
+            raise ActionInterrupted('Action cancelled: interrupt condition fired')
         self.active_goal = None
         wrapped = result.result()
         if wrapped.status != GoalStatus.STATUS_SUCCEEDED:
@@ -239,6 +274,56 @@ class Trial(Node):
         if xy > .12 or dyaw > .15:
             raise RuntimeError(f'Navigation final error: {xy:.3f}m, {dyaw:.3f}rad')
         self.event('ARRIVED',xy_error=xy,yaw_error=dyaw)
+
+    SQUARE_UP_TOLERANCE = .015
+    SQUARE_UP_MAX_RATE = .3
+    SQUARE_UP_MIN_RATE = .05
+    SQUARE_UP_GAIN = 1.5
+
+    @staticmethod
+    def heading_error(target,actual):
+        """Signed shortest rotation from actual to target heading, in radians."""
+        return math.atan2(math.sin(target-actual),math.cos(target-actual))
+
+    @classmethod
+    def square_up_rate(cls,error):
+        """Proportional turn rate, floored so the smoother deadband cannot stall it."""
+        magnitude=min(cls.SQUARE_UP_MAX_RATE,max(cls.SQUARE_UP_MIN_RATE,
+                                                 cls.SQUARE_UP_GAIN*abs(error)))
+        return math.copysign(magnitude,error)
+
+    def odom_yaw(self):
+        q=self.odom.pose.pose.orientation
+        return math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z))
+
+    def square_up(self,yaw,timeout=25.):
+        """Rotate in place until the base heading is within SQUARE_UP_TOLERANCE.
+
+        Commands go through /cmd_vel_nav, so the velocity smoother, collision
+        monitor and footprint guard still apply. A timeout is reported and the
+        trial continues from the Nav2 arrival heading rather than failing.
+        """
+        if self.odom is None or time.monotonic()-self.odom_received > 2.:
+            raise RuntimeError('Odometry unavailable or stale before squaring up')
+        deadline=time.monotonic()+timeout
+        try:
+            while rclpy.ok() and time.monotonic() < deadline:
+                if self.abort_reason:
+                    raise RuntimeError(self.abort_reason)
+                error=self.heading_error(yaw,self.odom_yaw())
+                if abs(error) < self.SQUARE_UP_TOLERANCE:
+                    self.stop.publish(Twist())
+                    self.event('BASE_SQUARED',yaw_error=abs(error))
+                    return True
+                command=Twist()
+                command.angular.z=self.square_up_rate(error)
+                self.stop.publish(command)
+                rclpy.spin_once(self,timeout_sec=.05)
+        finally:
+            self.stop.publish(Twist())
+        self.event('BASE_SQUARE_UP_TIMEOUT',
+                   yaw_error=abs(self.heading_error(yaw,self.odom_yaw())))
+        return False
 
     def find(self, kind, target, column_point=None, timeout=12.):
         observations = []
@@ -359,6 +444,11 @@ class Trial(Node):
         # identical across all five columns.
         grasp_base=Manipulator.shelf_base_pose(book['point'])
         self.navigate(*grasp_base,-math.pi/2)
+        # Nav2 accepts up to its goal-checker heading tolerance, and trials
+        # arrived up to ~9 deg off square. Every grasp constant assumes the base
+        # faces the shelf normal; at that skew the elbow swings towards the shelf
+        # and clipped it on the retreat. Square up before the arm moves.
+        self.square_up(-math.pi/2)
         # Re-observe from the final base position.  Books are randomized within
         # each shelf cell, so the live RGB-D coordinate is the only usable
         # source; a marker-relative constant causes systematic misses and can
@@ -371,9 +461,103 @@ class Trial(Node):
         self.manipulator.carry()
         self.deliver()
 
+    # Nav2 limits while a book is held. At the normal limits a book that had
+    # survived extraction and the arm swing, and sat still in the gripper for
+    # 12 s, slipped out within seconds of the base starting to drive back.
+    NORMAL_MOTION = {
+        'controller_server': {
+            'FollowPath.max_vel_x': .25, 'FollowPath.max_vel_y': .15,
+            'FollowPath.max_speed_xy': .25, 'FollowPath.max_vel_theta': .5,
+            'FollowPath.acc_lim_x': .35, 'FollowPath.acc_lim_y': .35,
+            'FollowPath.acc_lim_theta': .75, 'FollowPath.decel_lim_x': -.35,
+            'FollowPath.decel_lim_y': -.35, 'FollowPath.decel_lim_theta': -.75},
+        'velocity_smoother': {
+            'max_velocity': [.25, .15, .5], 'max_accel': [.35, .35, .75],
+            'max_decel': [-.35, -.35, -.75]},
+    }
+    CARRY_FRACTION = 1/3
+
+    @classmethod
+    def motion_limits(cls, carrying):
+        """Nav2 parameters per node: the launch values, scaled down while carrying."""
+        scale = cls.CARRY_FRACTION if carrying else 1.
+        def scaled(value):
+            return [v*scale for v in value] if isinstance(value, list) else value*scale
+        return {node: {name: scaled(value) for name, value in params.items()}
+                for node, params in cls.NORMAL_MOTION.items()}
+
+    def set_carry_mode(self, carrying):
+        """Apply motion_limits at runtime; a node that refuses is reported, not fatal."""
+        clients = getattr(self, 'parameter_clients', None)
+        if clients is None:
+            clients = self.parameter_clients = {}
+        for node, params in self.motion_limits(carrying).items():
+            if node not in clients:
+                clients[node] = self.create_client(SetParameters, f'/{node}/set_parameters')
+            client = clients[node]
+            if not client.wait_for_service(timeout_sec=5.):
+                self.event('CARRY_MODE_UNAVAILABLE', node=node, carrying=carrying)
+                continue
+            request = SetParameters.Request(parameters=[
+                Parameter(name, value=value).to_parameter_msg() for name, value in params.items()])
+            future = client.call_async(request)
+            if not self.wait(future.done, 10.) or not all(r.successful for r in future.result().results):
+                self.event('CARRY_MODE_REJECTED', node=node, carrying=carrying)
+        self.event('CARRY_MODE', carrying=carrying)
+
+    # Base-to-bin distance for placement: the table is 80 cm deep with the bin
+    # at its centre, so this leaves ~9 cm between the base front and the table
+    # while keeping the bin within the 0.80 m placement reach.
+    BIN_STANDOFF = .80
+    BIN_APPROACH_TOLERANCE = .03
+    BIN_APPROACH_MAX = .12
+    BIN_APPROACH_SPEED = .05
+
+    @classmethod
+    def bin_gap(cls, base_xy, bin_xy):
+        """Forward distance still to close before placing; 0 if already close enough."""
+        gap = float(np.hypot(bin_xy[0]-base_xy[0], bin_xy[1]-base_xy[1])) - cls.BIN_STANDOFF
+        if gap <= cls.BIN_APPROACH_TOLERANCE:
+            return 0.
+        return min(gap, cls.BIN_APPROACH_MAX)
+
+    def close_to_bin(self, bin_point, timeout=30.):
+        """Creep straight ahead by bin_gap. Returns True if the base moved."""
+        start = self.odom.pose.pose.position
+        gap = self.bin_gap((start.x, start.y), bin_point)
+        if gap <= 0.:
+            return False
+        deadline = time.monotonic()+timeout
+        command = Twist(); command.linear.x = self.BIN_APPROACH_SPEED
+        try:
+            while rclpy.ok() and time.monotonic() < deadline:
+                if self.abort_reason:
+                    raise RuntimeError(self.abort_reason)
+                now = self.odom.pose.pose.position
+                if np.hypot(now.x-start.x, now.y-start.y) >= gap:
+                    break
+                self.stop.publish(command)
+                rclpy.spin_once(self, timeout_sec=.05)
+        finally:
+            self.stop.publish(Twist())
+        self.event('BIN_APPROACHED', gap=gap)
+        return True
+
     def deliver(self):
+        self.set_carry_mode(True)
+        try:
+            self._deliver()
+        finally:
+            self.set_carry_mode(False)
+
+    def _deliver(self):
         self.contact_phase='carry'
         self.navigate(*self.start_pose)
+        # Without this check the robot searched for the bin with an empty
+        # gripper after the book had dropped near the shelf.
+        if not self.manipulator.book_retained():
+            self.event('BOOK_LOST_IN_TRANSPORT')
+            raise RuntimeError('Target book was lost while driving back to the start zone')
         bin_detection=None
         for heading in (self.start_pose[2]+math.pi/2,self.start_pose[2],
                         self.start_pose[2]-math.pi/2,self.start_pose[2]+math.pi):
@@ -392,12 +576,17 @@ class Trial(Node):
         pos=self.odom.pose.pose.position
         direction=np.array(bin_detection['point'][:2])-np.array([pos.x,pos.y])
         direction/=np.linalg.norm(direction)
-        drop_base=np.array(bin_detection['point'][:2])-.85*direction
+        drop_base=np.array(bin_detection['point'][:2])-self.BIN_STANDOFF*direction
         self.navigate(*drop_base,math.atan2(direction[1],direction[0]))
         self.aim_at_point(bin_detection['point'])
         refreshed=self.find('bin','red',timeout=10.)
         if not refreshed:
             raise RuntimeError('Red collection bin lost at placement pose')
+        # Nav2 arrives within its 8 cm goal tolerance, but the arm only reaches
+        # 0.80 m over the bin; close any remaining gap from the fresh sighting.
+        if self.close_to_bin(refreshed['point']):
+            self.aim_at_point(refreshed['point'])
+            refreshed=self.find('bin','red',timeout=10.) or refreshed
         self.contact_phase='place'
         self.manipulator.place(refreshed['point'])
         self.completed=True

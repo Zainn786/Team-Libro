@@ -78,10 +78,10 @@ class LivePerception:
                 and self.depth_info.k[0] > 0 and self.depth_info.k[4] > 0
                 and np.allclose(self.info.k,self.depth_info.k,atol=1e-6))
 
-    def point(self, bbox):
+    def point(self, bbox, max_spread=.20):
         if not self.ready():
             return None
-        d = robust_depth(self.depth, bbox)
+        d = robust_depth(self.depth, bbox, max_spread)
         if d is None:
             return None
         x,y,w,h = bbox
@@ -102,6 +102,26 @@ class LivePerception:
         except TransformException:
             return None
 
+    # A carried book's blob centroid stays within ~0.1 m of the grasp frame; the
+    # bin is at least ~0.35 m from the gripper even at the placement pose.
+    HELD_OBJECT_RADIUS = .25
+
+    @staticmethod
+    def within(point, other, radius):
+        """True when both points exist and lie closer than radius."""
+        return other is not None and float(np.linalg.norm(np.array(point[:3])-np.array(other[:3]))) < radius
+
+    def gripper_point(self):
+        """Left grasp frame in odom, or None when TF is unavailable."""
+        try:
+            t = self.tf.lookup_transform('odom','gripper_left_grasping_link',Time()).transform.translation
+        except TransformException:
+            return None
+        return [t.x,t.y,t.z]
+
+    def near_gripper(self, point):
+        return self.within(point, self.gripper_point(), self.HELD_OBJECT_RADIUS)
+
     def observe(self, kind, target, column_point=None):
         if not self.ready():
             return []
@@ -117,7 +137,10 @@ class LivePerception:
         for item in detections:
             if item.get('number' if kind == 'column' else 'colour') != target:
                 continue
-            point = self.point(item['bbox'])
+            # An open bin seen from above spans rim to floor (0.32 m measured at
+            # 1.1 m), so its depth is taken as the median without the
+            # two-surface rejection used for books and markers.
+            point = self.point(item['bbox'], None if kind == 'bin' else .20)
             if point is None:
                 continue
             if kind == 'column' and not 2.0 < point[2] < 2.5:
@@ -133,6 +156,12 @@ class LivePerception:
                     continue
                 item['row'] = index+1
             if kind == 'bin' and not .35 < point[2] < 1.8:
+                continue
+            # The target books are red too. While one is carried in the gripper
+            # it sits in the head camera's view during the bin search and can
+            # pass the bin shape filter, either posing as the bin or making the
+            # detection ambiguous so find() never sees a unique candidate.
+            if kind == 'bin' and self.near_gripper(point):
                 continue
             item['point'] = point
             item['stamp_ns'] = Time.from_msg(self.rgb_msg.header.stamp).nanoseconds

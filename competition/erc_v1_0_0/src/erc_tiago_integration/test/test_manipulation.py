@@ -3,8 +3,9 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from geometry_msgs.msg import Pose
 from moveit_msgs.srv import ApplyPlanningScene
-from moveit_msgs.msg import CollisionObject
+from moveit_msgs.msg import CollisionObject, RobotTrajectory
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from erc_tiago_integration.manipulation import Manipulator
@@ -34,11 +35,11 @@ def test_insertion_seats_both_fingertip_pads_on_the_book():
     assert np.allclose(grasp,[.94,expected_grasp_y,.605])
     # Insertion is normal to the shelf: no lateral or vertical sweep on the way in.
     assert np.allclose(pre,[.94,front+lead+.04,.605])
-    # Withdraw a full book depth plus clearance, measured from the front cover.
-    assert np.allclose(pull,[.94,front+Manipulator.BOOK_DEPTH+.02,.630])
+    # The final waypoint adds no pull beyond one book depth: only a lift.
+    assert np.allclose(pull,[.94,expected_grasp_y+Manipulator.BOOK_DEPTH,.6425])
     # The post-extraction lift is deliberately limited to 3 cm to retain shelf
     # clearance while confirming that the book remains secured.
-    assert np.allclose(lift,[.94,front+Manipulator.BOOK_DEPTH+.02,.660])
+    assert np.allclose(lift,[.94,expected_grasp_y+Manipulator.BOOK_DEPTH,.6725])
 
 
 def test_high_shelf_stands_further_back_before_inserting():
@@ -71,6 +72,14 @@ def test_both_fingertip_pads_bear_on_the_book_at_the_grasp_pose():
     assert leading_edge_depth > Manipulator.FAR_PAD_DEPTH > Manipulator.NEAR_PAD_DEPTH
     # ...without reaching the back of the shelf.
     assert leading_edge_depth < Manipulator.BOOK_DEPTH
+
+
+def test_insertion_never_drives_the_palm_into_the_cover():
+    """The palm has no contact sensor; a deeper seat pushed a book 112 mm back."""
+    for depth in Manipulator.INSERTION_DEPTHS:
+        assert depth <= Manipulator.GRIPPER_THROAT_DEPTH - Manipulator.PALM_CLEARANCE + 1e-9
+        # Both contact pads still bear on the cover.
+        assert depth > Manipulator.FAR_PAD_DEPTH
 
 
 def test_finger_joint_and_pad_span_are_mutual_inverses():
@@ -138,14 +147,16 @@ def test_cartesian_continuity_rejects_jumps_and_nonfinite_values(positions):
         Manipulator.validate_cartesian_joints(trajectory)
 
 
-def test_partial_cartesian_path_is_never_executed():
+def test_partial_cartesian_path_is_never_executed(monkeypatch):
+    monkeypatch.setattr('erc_tiago_integration.manipulation.time.sleep',lambda s:None)
     manipulator=Manipulator.__new__(Manipulator)
     manipulator.tip='gripper_left_grasping_link'
     manipulator.cartesian=object()
     manipulator.call=lambda client,request:SimpleNamespace(
         error_code=SimpleNamespace(val=1),fraction=.97)
     executed=[]
-    manipulator.node=SimpleNamespace(action=lambda *args:executed.append(args))
+    manipulator.node=SimpleNamespace(action=lambda *args:executed.append(args),
+                                     event=lambda state,**data:None)
     with pytest.raises(RuntimeError,match='Incomplete collision-free'):
         manipulator.straight([Manipulator._base_pose(np.array([.5,0.,.6]),0.)])
     assert not executed
@@ -221,25 +232,32 @@ def test_base_shell_and_wheels_are_mutually_allowed():
 
 
 def test_extraction_requires_full_travel_only_while_inside_the_shelf():
-    """A short final clearance move is not a failure; a short withdrawal is."""
-    fractions=[]
-    manipulator=Manipulator.__new__(Manipulator)
-    manipulator.straight=lambda poses,min_fraction=.999,**kw:fractions.append(min_fraction)
-    manipulator.pose=lambda point,yaw:point
+    """A full book depth is out after two segments; the clearance move is best-effort."""
     _,grasp,pull,_=Manipulator.shelf_grasp_points([0.,-2.8,.6])
     extraction=[]
     for distance,height in ((.08,0.),(.16,.0125)):
         point=grasp.copy();point[1]+=distance;point[2]+=height
         extraction.append(point)
     extraction.append(pull)
-    for index,point in enumerate(extraction,1):
-        final=index == len(extraction)
-        manipulator.straight([manipulator.pose(point,0.)],
-                             min_fraction=.85 if final else .999)
-    assert fractions[:-1]==[.999,.999]
-    assert fractions[-1]==.85
     # By the last segment a full book depth is already clear of the shelf.
     assert extraction[1][1]-grasp[1] >= Manipulator.BOOK_DEPTH
+    assert 0. < Manipulator.FINAL_CLEARANCE_MIN_FRACTION < .999
+
+
+def test_final_extraction_waypoint_only_lifts():
+    """Extra pull-back swung the forearm into the shelf end at an outer column."""
+    _,grasp,pull,_=Manipulator.shelf_grasp_points([2.1,-2.8,.6])
+    segment_two_end=grasp.copy();segment_two_end[1]+=.16;segment_two_end[2]+=.0125
+    assert pull[0]==pytest.approx(segment_two_end[0])
+    assert pull[1]==pytest.approx(segment_two_end[1])
+    assert pull[2] > segment_two_end[2]
+
+
+def test_blocked_final_clearance_move_is_skipped_not_fatal():
+    import inspect
+    source=inspect.getsource(Manipulator.grasp)
+    assert "BOOK_FINAL_CLEARANCE_SKIPPED" in source
+    assert "FINAL_CLEARANCE_MIN_FRACTION" in source
 
 
 def test_reobservation_updates_the_target_between_attempts():
@@ -249,9 +267,32 @@ def test_reobservation_updates_the_target_between_attempts():
         reobserve_target=lambda point:[point[0]+.01,point[1],point[2]],
         event=lambda state,**data:events.append((state,data)))
     updated=manipulator.reobserve_book([1.,-2.8,.6])
-    assert updated==[1.01,-2.8,.6]
+    assert updated==pytest.approx([1.01,-2.8,.6])
     assert events[0][0]=='BOOK_REOBSERVED'
     assert events[0][1]['moved'] == pytest.approx(.01)
+
+
+def test_height_only_jump_after_a_failed_closure_is_treated_as_occlusion():
+    """Values from a live trial: same plane fix, 90 mm lower, book undisturbed."""
+    manipulator=Manipulator.__new__(Manipulator)
+    events=[]
+    first=[-2.1613824654224656,-2.7744053222023393,1.5923089926791554]
+    second=[-2.1607051395488486,-2.7741313291293856,1.502319253110904]
+    manipulator.node=SimpleNamespace(reobserve_target=lambda point:second,
+                                     event=lambda state,**data:events.append(data))
+    updated=manipulator.reobserve_book(first)
+    assert updated[2]==pytest.approx(first[2])
+    assert updated[:2]==pytest.approx(second[:2])
+    assert events[0]['height_rejected_as_occlusion'] is True
+
+
+def test_real_displacement_still_updates_height_and_plane():
+    manipulator=Manipulator.__new__(Manipulator)
+    manipulator.node=SimpleNamespace(
+        reobserve_target=lambda point:[point[0]+.05,point[1],point[2]-.06],
+        event=lambda state,**data:None)
+    updated=manipulator.reobserve_book([1.,-2.8,.6])
+    assert updated==pytest.approx([1.05,-2.8,.54])
 
 
 def test_reobservation_aborts_when_the_book_has_been_displaced():
@@ -270,6 +311,67 @@ def test_reobservation_keeps_the_old_estimate_when_the_book_is_not_seen():
     manipulator.node=SimpleNamespace(reobserve_target=lambda point:None,
                                      event=lambda state,**data:None)
     assert manipulator.reobserve_book([1.,-2.8,.6]) is None
+
+
+def test_bottom_row_lifts_the_torso_off_its_lower_stop():
+    """With the torso fully down the bottom-row approach pose has no IK
+    solution from any seed, even with collision checking disabled."""
+    assert Manipulator.torso_height_for_row(.605) == .15
+    # Middle rows sit near shoulder height and keep the configuration that has
+    # already grasped a book.
+    assert Manipulator.torso_height_for_row(.935) == 0.
+    assert Manipulator.torso_height_for_row(1.265) == .15
+    assert Manipulator.torso_height_for_row(1.595) == .3
+    # Every commanded height stays inside the 35 cm of torso travel.
+    for row in (.605,.935,1.265,1.595):
+        assert 0. <= Manipulator.torso_height_for_row(row) <= .35
+
+
+def _cartesian_manipulator(fractions):
+    manipulator=Manipulator.__new__(Manipulator)
+    events=[]
+    manipulator.node=SimpleNamespace(event=lambda state,**data:events.append((state,data)),
+                                     action=lambda *a,**k:SimpleNamespace(error_code=SimpleNamespace(val=1)))
+    manipulator.cartesian=object();manipulator.execute=object()
+    manipulator.tip='gripper_left_grasping_link'
+    replies=iter(fractions)
+    def call(client,request):
+        point=JointTrajectoryPoint(positions=[0.]*7)
+        point.time_from_start.sec=1
+        trajectory=JointTrajectory(joint_names=[f'arm_left_{i}_joint' for i in range(1,8)],
+                                   points=[point])
+        return SimpleNamespace(error_code=SimpleNamespace(val=1),fraction=next(replies),
+                               solution=RobotTrajectory(joint_trajectory=trajectory))
+    manipulator.call=call
+    return manipulator,events
+
+
+def test_short_cartesian_path_is_replanned_before_failing(monkeypatch):
+    monkeypatch.setattr('erc_tiago_integration.manipulation.time.sleep',lambda s:None)
+    manipulator,events=_cartesian_manipulator([.055,1.])
+    manipulator.straight([Pose()],min_fraction=.84)
+    assert [state for state,_ in events]==['CARTESIAN_REPLANNING']
+    assert events[0][1]['fraction']==pytest.approx(.055)
+
+
+def test_persistently_short_cartesian_path_still_fails(monkeypatch):
+    monkeypatch.setattr('erc_tiago_integration.manipulation.time.sleep',lambda s:None)
+    attempts=Manipulator.CARTESIAN_PLAN_ATTEMPTS
+    manipulator,events=_cartesian_manipulator([.055]*attempts)
+    with pytest.raises(RuntimeError,match='Incomplete collision-free Cartesian path'):
+        manipulator.straight([Pose()],min_fraction=.84)
+    assert len(events)==attempts
+
+
+def test_only_links_that_stay_outside_the_shelf_are_padded():
+    """The wrist and gripper work inside the shelf row; padding them would
+    make every insertion invalid. The upper arm never needs to get that close."""
+    padded=set(Manipulator.PADDED_ARM_LINKS)
+    assert {'arm_left_3_link','arm_left_4_link'} <= padded
+    for link in ('arm_left_5_link','arm_left_6_link','arm_left_7_link',
+                 'gripper_left_base_link','gripper_left_fingertip_left_link'):
+        assert link not in padded
+    assert 0. < Manipulator.UPPER_ARM_PADDING <= .05
 
 
 def test_alignment_sweep_covers_the_span_nearest_first():
@@ -340,8 +442,11 @@ def test_confirmed_grip_stops_closure_and_holds_measured_opening():
     def wait(predicate,timeout):
         for step in range(40):
             now.nanoseconds+=100_000_000
-            manipulator.gripper_position=max(0.,manipulator.gripper_position-.002)
-            manipulator.finger_contacts={'left':now.nanoseconds,'right':now.nanoseconds}
+            # The fingers meet the 30 mm book faces near joint 0.028, not at the
+            # open position; stop closing there like the real jaws do.
+            manipulator.gripper_position=max(.028,manipulator.gripper_position-.002)
+            if manipulator.gripper_position <= .028:
+                manipulator.finger_contacts={'left':now.nanoseconds,'right':now.nanoseconds}
             if predicate():
                 return True
         return False
@@ -358,7 +463,7 @@ def test_confirmed_grip_stops_closure_and_holds_measured_opening():
     # book blocks that travel, so the unreached remainder becomes the grip
     # force; holding the contact position itself applies none.
     assert grip_event['hold_opening'] == pytest.approx(
-        grip_event['contact_opening']-.005)
+        grip_event['contact_opening']-Manipulator.GRIP_SQUEEZE)
     assert sent[1].trajectory.points[0].positions[0] == pytest.approx(
         grip_event['hold_opening'])
     # The recorded width is what the jaws actually closed on, for trial evidence.
