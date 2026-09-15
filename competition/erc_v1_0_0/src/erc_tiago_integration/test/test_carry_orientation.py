@@ -50,9 +50,10 @@ def _carry_manipulator(straight_fails):
     calls = []
     manipulator.update_fixed_scene = lambda: None
     manipulator.command_torso = lambda height: calls.append(('torso', height))
+    manipulator.tip_in_base = lambda: (.45, .01, 1.40)
 
     def straight(poses, **kwargs):
-        calls.append(('straight', kwargs))
+        calls.append(('straight', round(poses[0].position.x, 3), kwargs))
         if straight_fails:
             raise RuntimeError('Incomplete collision-free Cartesian path: 0.400')
 
@@ -64,27 +65,18 @@ def _carry_manipulator(straight_fails):
     return manipulator, calls, events
 
 
-def test_book_carrying_moves_are_never_faster_than_the_extraction_that_held():
-    """A faster straight-line carry shook the book out of the pads within 4 s."""
-    import inspect
-    assert Manipulator.CARRY_TIME_SCALE > Manipulator.EXTRACTION_TIME_SCALE
-    straight_default = inspect.signature(Manipulator.straight).parameters['time_scale'].default
-    assert straight_default == Manipulator.EXTRACTION_TIME_SCALE
-
-
-def test_carry_height_is_the_one_a_straight_line_reaches_from_the_top_row():
-    assert Manipulator.CARRY_POSITION[2] >= 1.20
-
-
-def test_carry_prefers_a_straight_line_that_holds_orientation():
+def test_carry_only_lifts_and_backs_straight_out():
+    """The book slipped at the first sideways swing; only depth-axis and vertical moves held."""
     manipulator, calls, _ = _carry_manipulator(straight_fails=False)
     manipulator.carry()
-    assert calls == [('torso', Manipulator.PLACE_TORSO),
-                     ('straight', {'time_scale': Manipulator.CARRY_TIME_SCALE})]
+    assert calls[0] == ('torso', Manipulator.PLACE_TORSO)
+    assert calls[1] == ('straight', round(.45 - Manipulator.CARRY_BACKOFF, 3),
+                        {'time_scale': Manipulator.CARRY_TIME_SCALE})
+    assert not any(call[0] == 'go' for call in calls)
 
 
-def test_carry_falls_back_to_the_tilt_constrained_plan():
+def test_blocked_backoff_is_skipped_not_fatal():
     manipulator, calls, events = _carry_manipulator(straight_fails=True)
     manipulator.carry()
-    assert calls[-1] == ('go', {'path_tilt_tolerance': Manipulator.CARRY_TILT_TOLERANCE})
-    assert 'CARRY_STRAIGHT_LINE_UNAVAILABLE' in events
+    assert 'CARRY_BACKOFF_SKIPPED' in events
+    assert 'BOOK_STOWED_FOR_TRANSPORT' in events

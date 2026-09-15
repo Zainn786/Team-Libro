@@ -33,6 +33,7 @@ def test_carry_raises_the_torso_before_moving_the_arm():
     manipulator = Manipulator.__new__(Manipulator)
     order = []
     manipulator.command_torso = lambda height: order.append(('torso', height))
+    manipulator.tip_in_base = lambda: (.45, 0., 1.40)
     manipulator.update_fixed_scene = lambda: order.append(('scene',))
     manipulator.straight = lambda poses, **kwargs: order.append(('straight',))
     manipulator.node = SimpleNamespace(wait=lambda predicate, timeout: True,
@@ -40,3 +41,18 @@ def test_carry_raises_the_torso_before_moving_the_arm():
     manipulator.carry()
     assert order[0] == ('torso', Manipulator.PLACE_TORSO)
     assert order.index(('straight',)) > 0
+
+
+def test_place_height_stays_near_the_carried_height():
+    assert Manipulator.place_position(.8, 0., 1.45)[2] == pytest.approx(Manipulator.PLACE_MAX_HEIGHT)
+    assert Manipulator.place_position(.8, 0., .95)[2] == pytest.approx(Manipulator.PLACE_HEIGHT)
+
+
+def test_released_book_lies_inside_the_bin_opening():
+    from erc_tiago_integration.solution import Trial
+    half_opening = .155
+    near_edge = Trial.BIN_STANDOFF - half_opening
+    far_edge = Trial.BIN_STANDOFF + half_opening
+    book_near = Manipulator.PLACE_MAX_REACH - .030
+    book_far = Manipulator.PLACE_MAX_REACH + .130
+    assert near_edge < book_near and book_far < far_edge

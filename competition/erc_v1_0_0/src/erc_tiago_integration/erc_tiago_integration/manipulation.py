@@ -96,8 +96,14 @@ class Manipulator:
     # forward at z=1.20, 0/4 at 0.85 m, and 0/4 at any distance at z=1.10.
     # Rotating the book 90 deg about vertical cut the reach to 0.65-0.70 m.
     PLACE_TORSO = .30
-    PLACE_MAX_REACH = .80
+    # The book extends from 30 mm in front of the grasp frame to 130 mm beyond
+    # it. With the base BIN_STANDOFF (0.80 m) from the bin centre, a 0.72 m
+    # reach puts the whole book inside the 31 cm opening, 4.5 cm past the near
+    # rim, without pushing to the 0.80 m limit.
+    PLACE_MAX_REACH = .72
     PLACE_HEIGHT = 1.20
+    PLACE_MAX_HEIGHT = 1.30
+    CARRY_BACKOFF = .10
     # Transport grasp-frame position in base_footprint. From the top row a
     # straight line to z=1.05 stopped at 72-88% (the descent runs the wrist
     # along the shelf front and past its reach); from z=1.20 up both a direct
@@ -913,25 +919,31 @@ class Manipulator:
                 'aborting instead of pushing it further')
         return observed
 
+    def tip_in_base(self):
+        """Grasp-frame position in base_footprint, or None if TF is unavailable."""
+        try:
+            t=self.node.vision.tf.lookup_transform('base_footprint',self.tip,Time()).transform.translation
+        except Exception:
+            return None
+        return (t.x,t.y,t.z)
+
     def carry(self):
-        # Lift the torso before the arm moves. The carry and placement reach
-        # was measured at this height; with the book already clear of the
-        # shelf the lift only raises it vertically.
+        # The pinch sits 50 mm off the book's centre of mass (the palm limits
+        # insertion), so the book only survives motion along its own depth axis
+        # (every extraction held) or straight vertical torso travel (held for the
+        # whole 0.15 m lift). It slipped out at the first sideways/back swing to a
+        # separate transport pose, even at 0.014 rad/s. So keep the extraction
+        # pose: lift the torso, back straight out along the shelf normal, and
+        # drive with the arm frozen.
         self.command_torso(self.PLACE_TORSO)
         self.update_fixed_scene()
-        # An unconstrained plan to the transport pose matched the grasp
-        # orientation only at its two ends; mid-path the wrist rotated, the
-        # pinched 300 g book twisted out of the pads and landed on the floor.
-        target=self._base_pose(np.array(self.CARRY_POSITION),0.)
-        # A straight Cartesian line holds the grasp orientation exactly and
-        # plans in well under a second. The orientation-constrained OMPL search
-        # is the fallback: from the top row it needed more than 30 s and
-        # returned "Unable to solve the planning problem" on its first attempt.
-        try:
-            self.straight([target],time_scale=self.CARRY_TIME_SCALE)
-        except RuntimeError as error:
-            self.node.event('CARRY_STRAIGHT_LINE_UNAVAILABLE',reason=str(error))
-            self.go(target,path_tilt_tolerance=self.CARRY_TILT_TOLERANCE)
+        tip=self.tip_in_base()
+        if tip is not None:
+            back=self._base_pose(np.array([tip[0]-self.CARRY_BACKOFF,tip[1],tip[2]]),0.)
+            try:
+                self.straight([back],time_scale=self.CARRY_TIME_SCALE)
+            except RuntimeError as error:
+                self.node.event('CARRY_BACKOFF_SKIPPED',reason=str(error))
         if not self.node.wait(self.book_retained,20.):
             since=time.monotonic()-self.node.last_grasp_contact
             raise RuntimeError('Target book was not retained in transport pose '
@@ -942,7 +954,8 @@ class Manipulator:
         self.update_fixed_scene()
         tf=self.node.vision.tf.lookup_transform('base_footprint','odom',Time())
         target=do_transform_pose(self._point_pose(bin_point),tf).position
-        centre=self.place_position(target.x,target.y)
+        tip=self.tip_in_base()
+        centre=self.place_position(target.x,target.y,tip[2] if tip else None)
         yaw=math.atan2(centre[1],centre[0])
         pose=self._base_pose(centre,yaw)
         # Carry and placement share a height, so this is a level horizontal
@@ -961,11 +974,16 @@ class Manipulator:
         self.node.event('BOOK_PLACED',bin_contacts=len(self.node.bin_contacts))
 
     @classmethod
-    def place_position(cls,x,y):
-        """Grasp-frame target over the bin, clamped to the measured arm reach."""
+    def place_position(cls,x,y,tip_z=None):
+        """Grasp-frame target over the bin, clamped to the measured arm reach.
+
+        Height stays close to the carried height so the final reach is nearly a
+        level push along the book's depth axis, the one motion it survives.
+        """
         distance=math.hypot(x,y)
         scale=min(1.,cls.PLACE_MAX_REACH/distance) if distance > 0 else 1.
-        return np.array([x*scale,y*scale,cls.PLACE_HEIGHT],dtype=float)
+        z=cls.PLACE_HEIGHT if tip_z is None else min(max(tip_z,cls.PLACE_HEIGHT),cls.PLACE_MAX_HEIGHT)
+        return np.array([x*scale,y*scale,z],dtype=float)
 
     @staticmethod
     def _point_pose(point):

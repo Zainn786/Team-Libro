@@ -15,6 +15,6 @@ def test_approach_is_capped_so_the_base_never_reaches_the_table():
     assert Trial.bin_gap((0., 0.), (1.5, 0.)) == pytest.approx(Trial.BIN_APPROACH_MAX)
 
 
-def test_standoff_keeps_the_bin_within_the_arms_placement_reach():
+def test_standoff_puts_the_bin_opening_within_placement_reach():
     from erc_tiago_integration.manipulation import Manipulator
-    assert Trial.BIN_STANDOFF <= Manipulator.PLACE_MAX_REACH
+    assert abs(Trial.BIN_STANDOFF - Manipulator.PLACE_MAX_REACH) < .155 - .03
