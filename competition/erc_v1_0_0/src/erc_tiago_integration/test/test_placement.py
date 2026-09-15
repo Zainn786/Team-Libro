@@ -56,3 +56,21 @@ def test_released_book_lies_inside_the_bin_opening():
     book_near = Manipulator.PLACE_MAX_REACH - .030
     book_far = Manipulator.PLACE_MAX_REACH + .130
     assert near_edge < book_near and book_far < far_edge
+
+
+def test_head_is_raised_clear_of_the_arm_before_placement():
+    from erc_tiago_integration.solution import Trial
+    calls = []
+    trial = SimpleNamespace(
+        PLACEMENT_HEAD_TILT=Trial.PLACEMENT_HEAD_TILT,
+        point_head=lambda pan, tilt: calls.append(('head', pan, tilt)),
+        event=lambda state, **data: calls.append(('event', state, data)))
+
+    Trial.clear_head_for_placement(trial)
+
+    assert calls == [
+        ('head', 0., Trial.PLACEMENT_HEAD_TILT),
+        ('event', 'HEAD_CLEARED_FOR_PLACEMENT',
+         {'tilt': Trial.PLACEMENT_HEAD_TILT}),
+    ]
+    assert Trial.PLACEMENT_HEAD_TILT <= .34907

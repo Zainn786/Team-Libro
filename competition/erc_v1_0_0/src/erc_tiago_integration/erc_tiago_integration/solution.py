@@ -512,6 +512,12 @@ class Trial(Node):
     BIN_APPROACH_TOLERANCE = .03
     BIN_APPROACH_MAX = .12
     BIN_APPROACH_SPEED = .05
+    # Bin detection leaves the camera pitched down beside the raised left arm.
+    # In the first complete carry trial MoveIt reported head_2_link touching
+    # arm_left_5_link at the start of placement, so every joint-space fallback
+    # rejected its start state.  Raise the head after the final RGB-D fix; the
+    # camera is no longer needed once the measured bin point has been saved.
+    PLACEMENT_HEAD_TILT = .30
 
     @classmethod
     def bin_gap(cls, base_xy, bin_xy):
@@ -542,6 +548,11 @@ class Trial(Node):
             self.stop.publish(Twist())
         self.event('BIN_APPROACHED', gap=gap)
         return True
+
+    def clear_head_for_placement(self):
+        """Move the downward-looking camera clear of the raised left arm."""
+        self.point_head(0., self.PLACEMENT_HEAD_TILT)
+        self.event('HEAD_CLEARED_FOR_PLACEMENT', tilt=self.PLACEMENT_HEAD_TILT)
 
     def deliver(self):
         self.set_carry_mode(True)
@@ -587,6 +598,7 @@ class Trial(Node):
         if self.close_to_bin(refreshed['point']):
             self.aim_at_point(refreshed['point'])
             refreshed=self.find('bin','red',timeout=10.) or refreshed
+        self.clear_head_for_placement()
         self.contact_phase='place'
         self.manipulator.place(refreshed['point'])
         self.completed=True
