@@ -365,22 +365,8 @@ def generate_urdf(**xacro_args):
         start = urdf.index(marker)
         end = urdf.index('</gazebo>', start)
         block = urdf[start:end]
-        block = block.replace('<mu1>0.9</mu1>', '<mu1>5.0</mu1>')
-        block = block.replace('<mu2>0.9</mu2>', '<mu2>5.0</mu2>')
-        urdf = urdf[:start] + block + urdf[end:]
-
-    for segment in ('fingertip_left', 'fingertip_right'):
-        marker = f'<link name="gripper_left_{segment}_link">'
-        start = urdf.index(marker)
-        end = urdf.index('</link>', start)
-        block = urdf[start:end]
-        collision = block.index('<collision>')
-        collision_end = block.index('</collision>', collision)
-        collision_block = block[collision:collision_end]
-        collision_block = collision_block.replace(
-            '<mesh filename="package://pal_pro_gripper_description/meshes/fingertip.stl"/>',
-            '<box size="0.04 0.07 0.034"/>')
-        block = block[:collision] + collision_block + block[collision_end:]
+        block = block.replace('<mu1>0.9</mu1>', '<mu1>2.0</mu1>')
+        block = block.replace('<mu2>0.9</mu2>', '<mu2>2.0</mu2>')
         urdf = urdf[:start] + block + urdf[end:]
 
     for segment in ('inner_finger_left', 'inner_finger_right',

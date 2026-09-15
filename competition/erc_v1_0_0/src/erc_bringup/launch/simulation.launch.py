@@ -119,9 +119,6 @@ def generate_launch_description():
         '/base_imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
         # Collection bin contact
         '/world/erc_world/model/erc_collection_bin/link/collection_bin_base_link/sensor/bin_contact_sensor/contact@ros_gz_interfaces/msg/Contacts[gz.msgs.Contacts',
-        '/grasp_stabilizer/attach@std_msgs/msg/String]gz.msgs.StringMsg',
-        '/grasp_stabilizer/detach@std_msgs/msg/Empty]gz.msgs.Empty',
-        '/grasp_stabilizer/state@std_msgs/msg/Bool[gz.msgs.Boolean',
     ]
 
     #  Contact sensors
