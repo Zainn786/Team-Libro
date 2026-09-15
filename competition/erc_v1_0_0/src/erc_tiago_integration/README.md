@@ -15,6 +15,28 @@ mock grasp is counted as competition success.
   book thickness/friction and gripper controller naming. Do not claim v1.0.0
   validation using results from the development revision.
 
+### Release defect: the v1.0.0 book does not fit the v1.0.0 gripper
+
+`erc_book.sdf` in v1.0.0 declares a **60 mm** collision box. Forward kinematics
+of the shipped finger linkage puts the fingertip contact pads **59.72 mm** apart
+at the `gripper_left_finger_joint` upper limit of 0.070 m, so the jaws cannot
+enclose the book. Confirmed in Gazebo Harmonic: a 60 mm box released between two
+`fingertip.stl` collisions held at full open comes to rest *on top* of them,
+while the 30 mm box from the later revision falls straight through.
+
+No grasp is physically possible on v1.0.0 without modifying organizer-supplied
+packages, which section 1.4 of the Phase 1 brief forbids and which the evaluation
+trial would not load in any case. This is raised with the organizing committee.
+Local grasp validation uses the corrected 30 mm book via
+`scripts/corrected_book.sh` in this package, which must be reverted before
+committing:
+
+```bash
+src/erc_tiago_integration/scripts/corrected_book.sh apply    # 60 mm -> 30 mm
+# ...run the trial...
+src/erc_tiago_integration/scripts/corrected_book.sh restore  # back to shipped
+```
+
 The simulator's operating system, ROS distribution, Gazebo and robot model are
 unchanged. This team package runs in the official Humble/Harmonic image.
 
@@ -80,9 +102,13 @@ meeting the rubric's full-column bounding-box requirement.
   before execution. Insertion follows the fixed shelf normal, with the book
   re-observed from the final base position. Head aiming checks measured joint
   positions before accepting a fresh image. Closure requires sustained contact
-  on both target fingertips, stops at measured contact, then maintains a small
-  preload. The insertion depth accounts for the book's visible front face and
-  the offset from MoveIt's grasp frame to the fingertip contact plane.
+  on both target fingertips, stops at measured contact, then squeezes 5 mm
+  further so the blocked travel becomes grip force. The fingertip mesh presents
+  two raised contact pads, 2-7 mm and 37-42 mm behind its leading edge; the
+  insertion depth seats both on the cover, measured from the book's observed
+  front face and the grasp-frame offset. Possession is proven only by live
+  contact reports. Nothing in this package depends on a modified robot model,
+  world, or Gazebo plugin.
 - `navigation_regression.py`: simulation-only routes to physical columns and back.
   These column coordinates are never used to resolve randomized shelf labels.
 
@@ -129,6 +155,8 @@ NumPy only and rejects a URDF hash mismatch.
 
 - Validate the exact organizer-approved simulator release on a clean second machine.
 - Complete and repeat live visual shelf and row identification with full rubric images.
+- Resolve the v1.0.0 book/gripper interference with the organizing committee and
+  confirm which release the evaluation trial runs.
 - Validate single-arm physical grasp, possession, stowed transport, visual bin
   identification and gentle placement confirmed by `/bin_contacts`.
 - Run at least five complete randomized trials and report failures as well as successes.

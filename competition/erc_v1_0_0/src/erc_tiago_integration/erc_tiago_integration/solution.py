@@ -280,6 +280,20 @@ class Trial(Node):
         self.event('BOOK_REALIGNED',detection=observed,evidence=evidence)
         return observed
 
+    def reobserve_target(self,book_point):
+        """Fresh RGB-D fix on the target book from the current base pose.
+
+        Used between failed grasp attempts. Returns None when the book cannot
+        be seen again, so the caller keeps its previous estimate rather than
+        treating a missed frame as a displacement.
+        """
+        try:
+            self.aim_at_point(book_point)
+            observed=self.find('book',self.colour,book_point,timeout=12.)
+        except RuntimeError:
+            return None
+        return observed['point'] if observed else None
+
     def run(self):
         self.event('STARTING', team='Libro',shelf=self.column,colour=self.colour,stage=self.stage)
         if not self.wait(lambda:self.odom is not None and self.vision.ready(),45.):
@@ -341,16 +355,17 @@ class Trial(Node):
         self.target_book_token=f'book_col_{physical_column}_row_{book["row"]+1}_{self.colour}'
         self.event('TARGET_BOOK_LOCKED',physical_column=physical_column,
                    token=self.target_book_token)
-        pos=self.odom.pose.pose.position
-        direction=np.array(book['point'][:2])-np.array([pos.x,pos.y])
-        direction/=np.linalg.norm(direction)
-        grasp_base=np.array(book['point'][:2])-.57*direction
-        self.navigate(*grasp_base,math.atan2(direction[1],direction[0]))
+        # Square up to the shelf normal so the manipulation geometry is
+        # identical across all five columns.
+        grasp_base=Manipulator.shelf_base_pose(book['point'])
+        self.navigate(*grasp_base,-math.pi/2)
+        # Re-observe from the final base position.  Books are randomized within
+        # each shelf cell, so the live RGB-D coordinate is the only usable
+        # source; a marker-relative constant causes systematic misses and can
+        # knock the book out of its row.
         book=self.refine_book(book,cp)
-        measured_x=book['point'][0]
-        book['point'][0]=cp[0]-.13
-        self.event('BOOK_GRASP_CALIBRATED',measured_x=measured_x,
-                   grasp_x=book['point'][0])
+        self.event('BOOK_GRASP_CALIBRATED',grasp_point=[float(v) for v in book['point']],
+                   base_pose=list(grasp_base))
         self.contact_phase='grasp'
         self.manipulator.grasp(book['point'])
         self.manipulator.carry()

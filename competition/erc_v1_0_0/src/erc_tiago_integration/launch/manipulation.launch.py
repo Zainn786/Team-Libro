@@ -25,6 +25,32 @@ def generate_launch_description():
     for joint in robot.findall('joint'):
         ET.SubElement(semantic,'disable_collisions',link1=joint.find('parent').get('link'),
                       link2=joint.find('child').get('link'),reason='Adjacent')
+    # The mobile base is one rigid assembly: the shell, its sensors, antennas,
+    # dock, suspensions and wheels are all mounted inside or against each other
+    # and are permanently in contact in the official meshes. Only some of those
+    # pairs are directly jointed -- each wheel hangs off its suspension link,
+    # not off base_link -- so the adjacency rule above leaves base_link against
+    # all four wheels permanently colliding. That makes EVERY whole-robot state
+    # invalid, which aborts planning while single-group checks still pass.
+    children={}
+    for joint in robot.findall('joint'):
+        children.setdefault(joint.find('parent').get('link'),[]).append(
+            joint.find('child').get('link'))
+    base_assembly=[]
+    frontier=['base_footprint']
+    while frontier:
+        link=frontier.pop()
+        base_assembly.append(link)
+        # Stop at the torso: it moves relative to the base and must keep its
+        # collision checks against the arms and the world.
+        if link.startswith('torso'):
+            continue
+        frontier.extend(children.get(link,()))
+    base_assembly=[link for link in base_assembly if not link.startswith('torso')]
+    for index,first in enumerate(sorted(base_assembly)):
+        for second in sorted(base_assembly)[index+1:]:
+            ET.SubElement(semantic,'disable_collisions',link1=first,link2=second,
+                          reason='Rigid mobile-base assembly')
     for side in ('left','right'):
         mechanical_pairs = [('torso_base_link', f'arm_{side}_1_link'),
             ('torso_lift_link', f'arm_{side}_1_link'),

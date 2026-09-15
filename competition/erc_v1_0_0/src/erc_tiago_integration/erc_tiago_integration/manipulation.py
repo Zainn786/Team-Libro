@@ -12,14 +12,14 @@ from moveit_msgs.action import MoveGroup, ExecuteTrajectory
 from moveit_msgs.msg import (CollisionObject, Constraints, PositionConstraint,
                              OrientationConstraint, BoundingVolume, AttachedCollisionObject,
                              AllowedCollisionEntry)
-from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath
+from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath, GetPlanningScene
+from moveit_msgs.msg import PlanningSceneComponents
 from rclpy.action import ActionClient
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import Mesh, MeshTriangle, SolidPrimitive
 from tf2_geometry_msgs import do_transform_pose
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from std_msgs.msg import Bool, Empty, String
 
 
 class UnilateralBookContact(RuntimeError):
@@ -33,10 +33,87 @@ class NoBookContact(RuntimeError):
 
 
 class Manipulator:
+    """One-arm primitives driving the unmodified PAL Pro gripper.
+
+    Every constant below is measured from the organizer-supplied
+    ``fingertip.stl`` and ``tiago_pro.urdf``; nothing here depends on a
+    modified robot model, world, or Gazebo plugin.
+    """
+
+    BOOK_DEPTH = .160                    # into the shelf
+    BOOK_HEIGHT = .250                   # standing on the shelf floor
+    # Distance from base_footprint to the grasp frame at the seated pose.  The
+    # base is placed from this rather than from the book's cover so that
+    # retuning the insertion depth never changes how far the arm has to reach.
+    BASE_GRASP_REACH = .571
+    # Lateral search used when the jaws close on nothing or touch on one side.
+    # A 30 mm book inside a 59.72 mm jaw leaves +/-14.9 mm of centring margin,
+    # and the base arrives with up to ~0.1 rad of yaw error, which is ~13 mm of
+    # lateral offset at this reach before any RGB-D error is counted.
+    # Pre-grasp stand-off, measured from the fingertip's leading edge to the
+    # cover. The base sits BASE_GRASP_REACH from the grasp frame, so a longer
+    # stand-off pulls the wrist back towards the chassis: at .29 the wrist sits
+    # only .236 m from base_footprint, which folds the forearm over the mobile
+    # base and torso and makes the pose unplannable at the upper rows. Low rows
+    # have to come in close for the same reason.
+    LOW_ROW_HEIGHT = 1.1
+    LOW_ROW_STANDOFF = .04
+    HIGH_ROW_STANDOFF = .15
+    ALIGNMENT_STEP = .012
+    ALIGNMENT_SPAN = .048
+    GRASP_ALIGNMENT_ATTEMPTS = 10
+    # A book that has shifted further than this is no longer standing where it
+    # was seen, and further insertions would only push it deeper or topple it.
+    BOOK_DISPLACED_LIMIT = .12
+
+    @classmethod
+    def alignment_sweep(cls):
+        """Candidate lateral offsets, nearest first, alternating either side."""
+        steps=int(round(cls.ALIGNMENT_SPAN/cls.ALIGNMENT_STEP))
+        return [sign*index*cls.ALIGNMENT_STEP
+                for index in range(1,steps+1) for sign in (1,-1)]
+    # Forward kinematics of the shipped finger linkage, evaluated in
+    # gripper_left_base_link.  gripper_left_finger_joint is prismatic over
+    # [-.001, .070]; the inner/outer/fingertip revolutes mimic it at -/+8.28,
+    # which leaves the fingertip meshes parallel across the whole stroke.
+    #
+    # The fingertip mesh is not a flat jaw.  Along the insertion axis it
+    # presents two raised contact pads, 2.0-7.0 mm and 37.0-42.0 mm behind the
+    # leading edge, separated by a recess.  Those pads, not the mesh bounding
+    # box, set the usable opening.
+    OPEN_FINGERTIP_GAP_JOINT = .070      # upper limit of gripper_left_finger_joint
+    OPEN_FINGERTIP_GAP = .05972          # pad-to-pad span at that limit
+    FINGERTIP_GAP_PER_METRE = .78286     # d(gap)/d(finger joint), both jaws
+    OPEN_FINGERTIP_LEADING_EDGE = .011859  # fingertip tip ahead of the grasp frame
+    NEAR_PAD_DEPTH = .007                # far edge of the leading contact pad
+    FAR_PAD_DEPTH = .042                 # far edge of the trailing contact pad
+    # Insert far enough that BOTH pads bear on the cover.  Gripping on the
+    # leading pad alone lets the book pivot out of the jaws during extraction.
+    FINGERTIP_BOOK_OVERLAP = FAR_PAD_DEPTH + .003
+
+    @classmethod
+    def finger_joint_for_width(cls, width):
+        """Finger-joint position whose pad-to-pad span equals ``width``."""
+        return cls.OPEN_FINGERTIP_GAP_JOINT - (
+            cls.OPEN_FINGERTIP_GAP - float(width)) / cls.FINGERTIP_GAP_PER_METRE
+
+    @classmethod
+    def width_for_finger_joint(cls, position):
+        """Pad-to-pad span at a measured finger-joint position."""
+        return cls.OPEN_FINGERTIP_GAP - (
+            cls.OPEN_FINGERTIP_GAP_JOINT - float(position)) * cls.FINGERTIP_GAP_PER_METRE
+
+    def gripper_gap(self):
+        """Current pad-to-pad span, or None before the first joint state."""
+        if self.gripper_position is None:
+            return None
+        return max(0.,self.width_for_finger_joint(self.gripper_position))
+
     def __init__(self, trial):
         self.node=trial
         self.apply=trial.create_client(ApplyPlanningScene,'/apply_planning_scene')
         self.cartesian=trial.create_client(GetCartesianPath,'/compute_cartesian_path')
+        self.scene=trial.create_client(GetPlanningScene,'/get_planning_scene')
         self.execute=ActionClient(trial,ExecuteTrajectory,'/execute_trajectory')
         self.gripper=ActionClient(trial,FollowJointTrajectory,
                                   '/gripper_left_controller/follow_joint_trajectory')
@@ -48,14 +125,7 @@ class Manipulator:
         self.head_positions={}
         self.finger_contacts={}
         self.hold_goal=None
-        self.grasp_fixed=False
-        self.attach_publisher=trial.create_publisher(String,'/grasp_stabilizer/attach',10)
-        self.detach_publisher=trial.create_publisher(Empty,'/grasp_stabilizer/detach',10)
-        trial.create_subscription(Bool,'/grasp_stabilizer/state',self.on_grasp_state,10)
         trial.create_subscription(JointState,'/joint_states',self.on_joints,10)
-
-    def on_grasp_state(self,message):
-        self.grasp_fixed=message.data
 
     def on_joints(self,message):
         for joint in ('head_1_joint','head_2_joint'):
@@ -88,23 +158,41 @@ class Manipulator:
         return do_transform_pose(p,tf)
 
     def go(self,pose):
-        goal=MoveGroup.Goal()
-        goal.request.group_name='left_arm'
-        goal.request.allowed_planning_time=15.
-        goal.request.num_planning_attempts=5
-        goal.request.max_velocity_scaling_factor=.2
-        goal.request.max_acceleration_scaling_factor=.2
-        goal.request.start_state.is_diff=True
-        pc=PositionConstraint();pc.header.frame_id='base_footprint';pc.link_name=self.tip;pc.weight=1.
-        pc.constraint_region=BoundingVolume(primitives=[SolidPrimitive(type=SolidPrimitive.SPHERE,dimensions=[.008])],primitive_poses=[pose])
-        oc=OrientationConstraint();oc.header.frame_id='base_footprint';oc.link_name=self.tip;oc.orientation=pose.orientation
-        oc.absolute_x_axis_tolerance=.08;oc.absolute_y_axis_tolerance=.08;oc.absolute_z_axis_tolerance=.08;oc.weight=1.
-        goal.request.goal_constraints=[Constraints(position_constraints=[pc],orientation_constraints=[oc])]
-        goal.planning_options.planning_scene_diff.is_diff=True
-        goal.planning_options.planning_scene_diff.robot_state.is_diff=True
-        result=self.node.action(self.node.move,goal,600.)
-        if result.error_code.val!=1:
-            raise RuntimeError(f'Arm plan/execute failed: {result.error_code.val}')
+        last_error=None
+        # OMPL occasionally returns a path that becomes invalid during time
+        # parameterization.  A bounded replan is safe because MoveIt refuses the
+        # invalid trajectory before execution and a new sample can use a clear
+        # elbow configuration.
+        for attempt in range(3):
+            goal=MoveGroup.Goal()
+            goal.request.group_name='left_arm'
+            goal.request.allowed_planning_time=20.
+            goal.request.num_planning_attempts=5
+            goal.request.max_velocity_scaling_factor=.2
+            goal.request.max_acceleration_scaling_factor=.2
+            goal.request.start_state.is_diff=True
+            pc=PositionConstraint();pc.header.frame_id='base_footprint';pc.link_name=self.tip;pc.weight=1.
+            pc.constraint_region=BoundingVolume(primitives=[SolidPrimitive(type=SolidPrimitive.SPHERE,dimensions=[.008])],primitive_poses=[pose])
+            oc=OrientationConstraint();oc.header.frame_id='base_footprint';oc.link_name=self.tip;oc.orientation=pose.orientation
+            oc.absolute_x_axis_tolerance=.08;oc.absolute_y_axis_tolerance=.08;oc.absolute_z_axis_tolerance=.08;oc.weight=1.
+            goal.request.goal_constraints=[Constraints(position_constraints=[pc],orientation_constraints=[oc])]
+            goal.planning_options.planning_scene_diff.is_diff=True
+            goal.planning_options.planning_scene_diff.robot_state.is_diff=True
+            try:
+                result=self.node.action(self.node.move,goal,600.)
+            except RuntimeError as error:
+                last_error=error
+                if attempt == 2:
+                    raise
+                self.node.event('ARM_REPLANNING',attempt=attempt+1,reason=str(error))
+                continue
+            if result.error_code.val==1:
+                return
+            last_error=RuntimeError(f'Arm plan/execute failed: {result.error_code.val}')
+            if attempt < 2:
+                self.node.event('ARM_REPLANNING',attempt=attempt+1,
+                                reason=str(last_error))
+        raise last_error
 
     def straight(self,poses,time_scale=4.,min_fraction=.999):
         request=GetCartesianPath.Request()
@@ -166,6 +254,7 @@ class Manipulator:
 
     def record_finger_contact(self,pair):
         stamp=self.node.get_clock().now().nanoseconds
+        recorded=False
         for side in ('left','right'):
             if any(any(f'gripper_left_{segment}_finger_{side}_link' in name
                        for segment in ('inner','outer')) or
@@ -176,6 +265,10 @@ class Manipulator:
         stamp=self.node.get_clock().now().nanoseconds
         return all(0 <= stamp-self.finger_contacts.get(side,-10**18) <= 1_000_000_000
                    for side in ('left','right'))
+
+    def book_retained(self):
+        """Possession is proven only by fresh gripper/book contact reports."""
+        return time.monotonic()-self.node.last_grasp_contact < 1.5
 
     def close_on_book(self,goal):
         self.finger_contacts.clear()
@@ -206,11 +299,10 @@ class Manipulator:
                 if self.gripper_position is not None and self.gripper_position < .005:
                     raise NoBookContact('Gripper closed without contacting the target book')
             stamp=self.node.get_clock().now().nanoseconds
-            closed_enough=(self.gripper_position is not None and
-                           initial_opening-self.gripper_position >= .005)
             recent=[side for side in ('left','right')
                     if 0 <= stamp-self.finger_contacts.get(side,-10**18) <= 1_000_000_000]
-            if closed_enough and len(recent)==1:
+            contact_confirmed=len(recent)==2
+            if len(recent)==1:
                 stable_since=None
                 if unilateral_side != recent[0]:
                     unilateral_side=recent[0]
@@ -219,7 +311,7 @@ class Manipulator:
                     raise UnilateralBookContact(unilateral_side)
                 return False
             unilateral_since=None;unilateral_side=None
-            if not closed_enough or len(recent)!=2:
+            if not contact_confirmed:
                 stable_since=None
                 return False
             if stable_since is None:
@@ -238,7 +330,10 @@ class Manipulator:
             raise RuntimeError('Gripper position unavailable at confirmed contact')
         cancel=handle.cancel_goal_async()
         self.node.wait(cancel.done,5.)
-        hold_opening=.05 if opening>=.05 else max(0.,opening-.005)
+        # Command 5 mm past the measured contact position.  The book blocks
+        # that travel, so the residual command becomes the squeeze that holds
+        # it; commanding the contact position itself leaves no normal force.
+        hold_opening=max(0.,opening-.005)
         hold=FollowJointTrajectory.Goal()
         hold.trajectory.joint_names=['gripper_left_finger_joint']
         point=JointTrajectoryPoint(positions=[hold_opening])
@@ -256,6 +351,7 @@ class Manipulator:
         self.hold_goal=preload_handle
         self.node.event('GRIP_CONFIRMED',gripper_position=self.gripper_position,
                         contact_opening=opening,hold_opening=hold_opening,
+                        measured_book_width=self.width_for_finger_joint(opening),
                         finger_contacts=dict(self.finger_contacts))
 
     def command_torso(self,height):
@@ -273,7 +369,13 @@ class Manipulator:
         request=ApplyPlanningScene.Request();request.scene.is_diff=True
         attached=AttachedCollisionObject();attached.link_name=self.tip
         attached.object.header.frame_id=self.tip;attached.object.id='carried_book'
-        shape=SolidPrimitive(type=SolidPrimitive.BOX,dimensions=[.16,.06,.25])
+        # Thickness is taken from the measured grip rather than assumed, so the
+        # planning-scene box matches whichever book release is loaded.  A
+        # degenerate measurement would shrink the box and let MoveIt plan the
+        # carried book through the shelf, so clamp it to a usable floor.
+        width=max(self.gripper_gap() or 0.,.02)
+        shape=SolidPrimitive(type=SolidPrimitive.BOX,
+                             dimensions=[self.BOOK_DEPTH,width,self.BOOK_HEIGHT])
         attached.object.primitives=[shape];attached.object.primitive_poses=[Pose()]
         attached.object.primitive_poses[0].orientation.w=1.
         attached.object.operation=CollisionObject.ADD
@@ -297,10 +399,7 @@ class Manipulator:
                               {'arena_shelf','carried_book'}|fingertips)
         if not self.call(self.apply,request).success:
             raise RuntimeError('Could not attach carried book to planning scene')
-        self.attach_publisher.publish(String(data=self.node.target_book_token))
-        if not self.node.wait(lambda:self.grasp_fixed,5.):
-            raise RuntimeError('Contact-verified Gazebo grasp stabilization failed')
-        self.node.event('GRASP_PHYSICS_STABILIZED',target=self.node.target_book_token)
+        self.node.event('BOOK_ATTACHED_TO_PLANNING_SCENE',target=self.node.target_book_token)
 
     def detach_book(self,remove_world=False):
         request=ApplyPlanningScene.Request();request.scene.is_diff=True
@@ -326,11 +425,31 @@ class Manipulator:
         if not self.call(self.apply,request).success:
             raise RuntimeError('Could not update shelf fingertip clearance')
 
+    # The mobile base is one rigid assembly. Each wheel hangs off its own
+    # suspension link rather than off base_link, so wheel-against-shell pairs
+    # are not adjacent and are permanently in contact in the official meshes.
+    # Leaving them enabled makes every whole-robot collision check fail, which
+    # aborts planning even though single-group checks still report valid.
+    BASE_ASSEMBLY_LINKS = (
+        'base_footprint','base_link','base_dock_link','base_imu_link',
+        'base_front_laser_link','base_rear_laser_link','virtual_base_laser_link',
+        'base_antenna_left_link','base_antenna_right_link',
+        'suspension_front_left_link','suspension_front_right_link',
+        'suspension_rear_left_link','suspension_rear_right_link',
+        'wheel_front_left_link','wheel_front_right_link',
+        'wheel_rear_left_link','wheel_rear_right_link')
+
     @staticmethod
     def mechanical_pairs():
         pairs={('torso_base_link','torso_lift_link'),
                ('torso_lift_link','head_1_link'),
-               ('head_2_link','head_front_camera_link')}
+               ('head_2_link','head_front_camera_link'),
+               ('base_link','torso_base_link'),
+               ('base_link','torso_fixed_column_link')}
+        assembly=Manipulator.BASE_ASSEMBLY_LINKS
+        pairs.update({(first,second)
+                      for index,first in enumerate(assembly)
+                      for second in assembly[index+1:]})
         for side in ('left','right'):
             pairs.update({('torso_base_link',f'arm_{side}_1_link'),
                           ('torso_lift_link',f'arm_{side}_1_link'),
@@ -354,19 +473,71 @@ class Manipulator:
                           for second in gripper_links[index+1:]})
         return pairs
 
+    def live_matrix(self):
+        """Current allowed-collision matrix, or None if the scene is unavailable.
+
+        MoveIt seeds this from the SRDF with every pair its self-collision
+        analysis found to be permanently or by-default in contact -- wheels,
+        casters, the torso column, the base. Those entries are not reproduced
+        anywhere in this package.
+        """
+        scene=getattr(self,'scene',None)
+        if scene is None:
+            return None
+        if not scene.service_is_ready() and not scene.wait_for_service(timeout_sec=5.):
+            return None
+        request=GetPlanningScene.Request()
+        request.components.components=PlanningSceneComponents.ALLOWED_COLLISION_MATRIX
+        future=scene.call_async(request)
+        if not self.node.wait(future.done,10.):
+            return None
+        result=future.result()
+        return result.scene.allowed_collision_matrix if result else None
+
     def configure_matrix(self,request,extra_pairs=None,extra_names=None):
+        """Add allowances to the live matrix instead of replacing it.
+
+        Publishing a freshly built matrix drops every pair it does not mention,
+        including MoveIt's SRDF defaults. The arm group still validates on its
+        own, so IK and a single-state check both look healthy, but whole-robot
+        checks -- which is what the Cartesian planner runs -- then report a
+        permanent base/wheel self-collision and every path returns fraction 0.
+        """
         pairs=self.mechanical_pairs()|set(extra_pairs or ())
         names=sorted({link for pair in pairs for link in pair}|set(extra_names or ()))
-        allowed=pairs|{(second,first) for first,second in pairs}|{(name,name) for name in names}
-        request.scene.allowed_collision_matrix.entry_names=names
-        request.scene.allowed_collision_matrix.entry_values=[AllowedCollisionEntry(
-            enabled=[(first,second) in allowed for second in names]) for first in names]
+        matrix=self.live_matrix()
+        if matrix is None or not matrix.entry_names:
+            # No live scene to extend (offline tests, or the service is not up
+            # yet): fall back to publishing just the pairs we know about.
+            base_names,base_values=[],[]
+        else:
+            base_names=list(matrix.entry_names)
+            base_values=[list(entry.enabled) for entry in matrix.entry_values]
+        index={name:position for position,name in enumerate(base_names)}
+        for name in names:
+            if name not in index:
+                index[name]=len(base_names)
+                base_names.append(name)
+                for row in base_values:
+                    row.append(False)
+                base_values.append([False]*len(base_names))
+        # Rows added before the last append are short; pad them all to square.
+        for row in base_values:
+            row.extend([False]*(len(base_names)-len(row)))
+        for first,second in pairs:
+            base_values[index[first]][index[second]]=True
+            base_values[index[second]][index[first]]=True
+        for name in names:
+            base_values[index[name]][index[name]]=True
+        request.scene.allowed_collision_matrix.entry_names=base_names
+        request.scene.allowed_collision_matrix.entry_values=[
+            AllowedCollisionEntry(enabled=row) for row in base_values]
 
     def grasp(self,book_point):
         self.command_torso(.3 if book_point[2] > 1.35 else .15 if book_point[2] > 1.05 else 0.)
         self.update_fixed_scene()
         pre,grasp,pull,_=self.shelf_grasp_points(book_point)
-        self.command_gripper(.07)
+        self.command_gripper(self.OPEN_FINGERTIP_GAP_JOINT)
         self.allow_shelf_fingertips(True)
         pre_pose=self.pose(pre,-math.pi/2)
         grasp_pose=self.pose(grasp,-math.pi/2)
@@ -375,21 +546,44 @@ class Manipulator:
         self.straight([grasp_pose],min_fraction=.84)
         lateral_offset=0.
         tried_offsets={lateral_offset}
-        for attempt in range(4):
+        for attempt in range(self.GRASP_ALIGNMENT_ATTEMPTS):
             try:
                 self.command_gripper(0.)
                 break
             except (UnilateralBookContact,NoBookContact) as contact:
-                if attempt==3:
+                if attempt == self.GRASP_ALIGNMENT_ATTEMPTS-1:
                     raise
-                self.command_gripper(.07)
+                self.command_gripper(self.OPEN_FINGERTIP_GAP_JOINT)
                 self.straight([pre_pose])
+                # Look again before trying a different offset. Each failed
+                # closure drives the open jaws a full insertion depth past the
+                # cover, which can shove the book out of its row; sweeping
+                # blindly after that just rams a book that is no longer there.
+                # A fresh observation either corrects the aim or reports the
+                # displacement, and re-observing is far cheaper than a miss.
+                reobserved=self.reobserve_book(book_point)
+                if reobserved is not None:
+                    book_point=reobserved
+                    pre,grasp,pull,_=self.shelf_grasp_points(book_point)
+                    pre[0]+=lateral_offset;grasp[0]+=lateral_offset
+                    pre_pose=self.pose(pre,-math.pi/2)
+                    grasp_pose=self.pose(grasp,-math.pi/2)
+                    pull_pose=self.pose(pull,-math.pi/2)
                 if isinstance(contact,UnilateralBookContact):
-                    target_offset=lateral_offset+(-.012 if contact.side=='left' else .012)
+                    # One fingertip reached the cover, so the book's side is
+                    # known: step the jaws towards it until both pads bear.
+                    target_offset=lateral_offset+(-self.ALIGNMENT_STEP
+                                                  if contact.side=='left'
+                                                  else self.ALIGNMENT_STEP)
                     side=contact.side
                 else:
-                    target_offset=next((candidate for candidate in (.012,-.012,.024,-.024)
-                                        if candidate not in tried_offsets),lateral_offset)
+                    # Nothing between the jaws: sweep outwards in alternating
+                    # steps. The span covers the worst combined base-yaw and
+                    # RGB-D lateral error seen in trials.
+                    target_offset=next((candidate for candidate in self.alignment_sweep()
+                                        if candidate not in tried_offsets),None)
+                    if target_offset is None:
+                        raise
                     side='none'
                 correction=target_offset-lateral_offset
                 lateral_offset=target_offset
@@ -400,6 +594,7 @@ class Manipulator:
                 grasp_pose=self.pose(grasp,-math.pi/2)
                 self.straight([pre_pose,grasp_pose],min_fraction=.84)
                 self.node.event('GRASP_LATERAL_REALIGNED',side=side,
+                                offset=float(lateral_offset),
                                 correction=float(grasp[0]-book_point[0]))
         self.attach_book()
         extraction=[]
@@ -408,12 +603,17 @@ class Manipulator:
             extraction.append(point)
         extraction.append(pull)
         for index,point in enumerate(extraction,1):
-            self.straight([self.pose(point,-math.pi/2)])
-            if not self.node.wait(lambda:time.monotonic()-self.node.last_grasp_contact<1.5,20.):
+            # While the book is still between the shelf boards the withdrawal
+            # has to stay on the shelf normal, so those segments must complete
+            # in full. The last segment only adds clearance and lift once a
+            # full book depth is already out, and `carry` replans from wherever
+            # it ends, so a path that stops short there is not a failure.
+            final=index == len(extraction)
+            self.straight([self.pose(point,-math.pi/2)],
+                          min_fraction=.85 if final else .999)
+            if not self.node.wait(self.book_retained,20.):
                 raise RuntimeError(f'Target book was not retained during extraction segment {index}')
             self.node.event('BOOK_EXTRACTION_SEGMENT',segment=index)
-            if index == 1 and self.gripper_position is not None and self.gripper_position > .046:
-                self.command_gripper(.045)
         self.node.event('BOOK_CLEAR_OF_SHELF')
         self.allow_shelf_fingertips(False)
         self.node.event('BOOK_GRASPED',gripper_position=self.gripper_position,
@@ -422,19 +622,70 @@ class Manipulator:
     @staticmethod
     def shelf_grasp_points(book_point):
         centre=np.array(book_point,dtype=float)
-        pre=centre.copy();pre[1]+=.30
-        # The first grip catches the front corners. A short shelf-supported
-        # pull exposes enough depth to reseat on the side faces without driving
-        # the wrist into the shelf.
-        grasp=centre.copy();grasp[1]-=.10
-        pull=centre.copy();pull[1]+=.10;pull[2]+=.025
+        # RGB-D supplies the visible front cover in odom (including wheel-odom
+        # drift), plus the lateral centre and the row height.  Books are
+        # randomized within each cell, so this measurement is the only source
+        # for the lateral and depth coordinates.
+        front=centre[1]
+        grasp=centre.copy()
+        # Seat the grasp frame so the fingertip's leading edge sits
+        # FINGERTIP_BOOK_OVERLAP past the front cover.  Both raised contact
+        # pads then bear on the book; a shallower seat closes the jaws on the
+        # air ahead of it, and the book is pushed rather than pinched.
+        grasp[1]=front+Manipulator.OPEN_FINGERTIP_LEADING_EDGE-Manipulator.FINGERTIP_BOOK_OVERLAP
+        # Stand-off is defined by the gap between the fingertip's leading edge
+        # and the cover, so it stays fixed if the insertion depth is retuned.
+        # At the two lower rows a long stand-back puts the wrist above the
+        # mobile base footprint and forces the forearm through the base/head,
+        # so those rows approach from close in.
+        pre=grasp.copy()
+        pre[1]=front+Manipulator.OPEN_FINGERTIP_LEADING_EDGE+(
+            Manipulator.LOW_ROW_STANDOFF if centre[2] < Manipulator.LOW_ROW_HEIGHT
+            else Manipulator.HIGH_ROW_STANDOFF)
+        # Withdraw one full book depth plus 20 mm before lifting, measured from
+        # the front cover rather than from the grasp frame.
+        pull=grasp.copy();pull[1]=front+Manipulator.BOOK_DEPTH+.02;pull[2]+=.025
         lift=pull.copy();lift[2]+=.03
         return pre,grasp,pull,lift
+
+    @staticmethod
+    def shelf_base_pose(book_point):
+        """Base (x, y) that puts the grasp frame at the demonstrated arm reach.
+
+        The shelf front is parallel to odom X with its outward normal along +Y,
+        so the base squares up to the shelf for every column.  A line-of-sight
+        approach instead becomes strongly diagonal at the outer columns, which
+        leaves the arm target lateral to the shoulder and the lower rows
+        unreachable.
+        """
+        _,grasp,_,_=Manipulator.shelf_grasp_points(book_point)
+        return float(book_point[0]),float(grasp[1]+Manipulator.BASE_GRASP_REACH)
+
+    def reobserve_book(self,book_point):
+        """Re-measure the target from the current pose, or None if unavailable.
+
+        Raises if the book is clearly no longer on its row, so a displaced book
+        ends the attempt instead of being pushed further into the shelf.
+        """
+        observer=getattr(self.node,'reobserve_target',None)
+        if observer is None:
+            return None
+        observed=observer(book_point)
+        if observed is None:
+            return None
+        moved=float(np.linalg.norm(np.array(observed)-np.array(book_point)))
+        self.node.event('BOOK_REOBSERVED',point=[float(v) for v in observed],
+                        moved=moved)
+        if moved > self.BOOK_DISPLACED_LIMIT:
+            raise RuntimeError(
+                f'Target book moved {moved:.3f} m from where it was grasped; '
+                'aborting instead of pushing it further')
+        return observed
 
     def carry(self):
         self.update_fixed_scene()
         self.go(self._base_pose(np.array([.38,.28,1.05]),0.))
-        if not self.node.wait(lambda:time.monotonic()-self.node.last_grasp_contact<1.5,20.):
+        if not self.node.wait(self.book_retained,20.):
             raise RuntimeError('Target book was not retained in transport pose')
         self.node.event('BOOK_STOWED_FOR_TRANSPORT')
 
@@ -445,13 +696,9 @@ class Manipulator:
         centre=np.array([target.x,target.y,max(target.z+.28,.85)],dtype=float)
         yaw=math.atan2(centre[1],centre[0])
         self.go(self._base_pose(centre,yaw))
-        if not self.node.wait(lambda:time.monotonic()-self.node.last_grasp_contact<1.5,20.):
+        if not self.node.wait(self.book_retained,20.):
             raise RuntimeError('Target book was not retained above collection bin')
-        self.detach_publisher.publish(Empty())
-        if not self.node.wait(lambda:not self.grasp_fixed,5.):
-            raise RuntimeError('Gazebo grasp stabilization did not release')
-        self.node.event('GRASP_PHYSICS_RELEASED')
-        self.command_gripper(.065)
+        self.command_gripper(self.OPEN_FINGERTIP_GAP_JOINT)
         self.detach_book()
         if not self.node.wait(lambda:bool(self.node.bin_contacts),45.):
             raise RuntimeError('Released target book was not detected in collection bin')
